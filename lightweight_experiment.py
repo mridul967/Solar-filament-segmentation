@@ -1,0 +1,880 @@
+# CELL 1: Downloading important binaries and importing libraries
+# This cell installs all required packages and imports them.
+# - pycocotools: For reading COCO JSON annotations and RLE encoding for submission
+# - albumentations: For data augmentation (flips, rotations)
+# - optuna: For short, sequential learning-rate/weight-decay trials
+
+!pip install optuna albumentations pycocotools -q
+
+import os
+import glob
+import gc
+import random
+import time
+import optuna
+import numpy as np
+import pandas as pd
+import cv2
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+import warnings
+warnings.filterwarnings('ignore')
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torch.cuda.amp import autocast, GradScaler
+
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+from pycocotools.coco import COCO
+from pycocotools import mask as maskUtils
+
+print(f"PyTorch Version: {torch.__version__}")
+print(f"CUDA Available: {torch.cuda.is_available()}")
+if torch.cuda.is_available():
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+
+# %% [code] {"execution":{"iopub.status.busy":"2026-10-17T10:17:42.375853Z","iopub.execute_input":"2026-10-17T10:17:42.376262Z","iopub.status.idle":"2026-10-17T10:17:42.388188Z","shell.execute_reply.started":"2026-10-17T10:17:42.376225Z","shell.execute_reply":"2026-10-17T10:17:42.387494Z"}}
+# CELL 2: Configuration class with exact Kaggle dataset paths
+# These paths were verified from the directory scan output:
+#   /kaggle/input/competitions/filament-segmentation-2026/MAGFiLO_1.0_Kaggle_2026/
+#       train/train_images/       -> .jpeg training images
+#       train/MAGFiLO_1.0_Annotations_kaggle2026_train.json -> ground truth masks
+#       test/test_images/         -> .jpeg test images
+
+class Config:
+    # === EXACT PATHS (verified from directory scan) ===
+    BASE_DIR = '/kaggle/input/competitions/filament-segmentation-2026/MAGFiLO_1.0_Kaggle_2026'
+    TRAIN_DIR = os.path.join(BASE_DIR, 'train/train_images')
+    TEST_DIR = os.path.join(BASE_DIR, 'test/test_images')
+    ANNOTATIONS_FILE = os.path.join(BASE_DIR, 'train/MAGFiLO_1.0_Annotations_kaggle2026_train.json')
+    OUT_DIR = '/kaggle/working/'
+    
+    # === IMAGE DIMENSIONS ===
+    # GONG H-alpha images are 2048x2048.
+    # We downscale to 512x512 for this lightweight experiment,
+    # then upscale predictions back to 2048x2048 for submission.
+    IMG_SIZE = 512
+    ORIGINAL_SIZE = 2048
+    
+    # === TRAINING HYPERPARAMETERS ===
+    BATCH_SIZE = 2
+    EPOCHS = 10           # Fresh training of the best short-trial configuration
+    N_TRIALS = 6          # Includes the baseline configuration as trial 0
+    TRIAL_EPOCHS = 3
+    SEED = 42
+    LR = 2e-4             # Learning rate (Adam optimizer)
+    WEIGHT_DECAY = 1e-4   # L2 regularization
+    NUM_WORKERS = 2       # DataLoader workers
+    DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+    
+    # === MODEL PARAMETERS ===
+    IN_CHANNELS = 3       # [Limb-corrected H-alpha, Limb-corrected copy, Magnetic Proxy Map]
+    OUT_CHANNELS = 1      # Single binary segmentation mask
+    
+    # === SUBMISSION PARAMETERS ===
+    MIN_AREA = 200        # Minimum pixel area to count as a valid filament (filters noise)
+    THRESHOLD = 0.4       # Probability threshold for binary mask
+
+# Verify paths exist
+print(f"Train dir exists: {os.path.exists(Config.TRAIN_DIR)}")
+print(f"Test dir exists:  {os.path.exists(Config.TEST_DIR)}")
+print(f"Annotations exist: {os.path.exists(Config.ANNOTATIONS_FILE)}")
+print(f"Train images: {len(glob.glob(os.path.join(Config.TRAIN_DIR, '*.jpeg')))}")
+print(f"Test images:  {len(glob.glob(os.path.join(Config.TEST_DIR, '*.jpeg')))}")
+
+# %% [code] {"execution":{"iopub.status.busy":"2026-10-17T10:17:42.390316Z","iopub.execute_input":"2026-10-17T10:17:42.390722Z","iopub.status.idle":"2026-10-17T10:17:42.407983Z","shell.execute_reply.started":"2026-10-17T10:17:42.390676Z","shell.execute_reply":"2026-10-17T10:17:42.407201Z"}}
+# CELL 3: Preprocessing Engine
+# Two key functions:
+# 1. remove_limb_darkening(): Removes the darkening effect at the Sun's edge
+#    by fitting a radial mask and normalizing pixel intensities.
+#    This prevents the network from confusing limb darkening with filaments.
+#
+# 2. get_magnetic_proxy(): Computes the Structure Tensor coherence map.
+#    Filaments form along magnetic Polarity Inversion Lines (PILs).
+#    Since we can't use actual magnetogram data (competition rules),
+#    we extract directional/anisotropic features from the H-alpha image
+#    to create a "pseudo-magnetic" orientation map.
+#    High coherence = filament-like structure (elongated, directional)
+#    Low coherence = isotropic noise (sunspots, granulation)
+
+def load_image(path):
+    """Load image handling both 16-bit and 8-bit formats."""
+    img = cv2.imread(path, cv2.IMREAD_ANYDEPTH)
+    if img is None:
+        img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    return img
+
+def remove_limb_darkening(img):
+    """
+    Removes limb darkening by creating a circular mask around the solar disk
+    and normalizing intensities within the disk.
+    
+    The Sun exhibits limb darkening: brightness decreases from center to edge.
+    Dark edges can be mistaken for filaments, so we mask them out.
+    
+    Returns:
+        img_norm: Normalized image with limb darkening removed
+        mask: Binary mask of the solar disk
+    """
+    h, w = img.shape
+    Y, X = np.ogrid[:h, :w]
+    cy, cx = h // 2, w // 2
+    
+    # Distance from center of solar disk
+    r = np.sqrt((X - cx)**2 + (Y - cy)**2)
+    max_r = np.min([cx, cy]) * 0.98  # 98% of radius to cleanly cut the limb
+    
+    # Create circular mask
+    mask = r < max_r
+    
+    # Normalize within the mask
+    img_masked = img * mask
+    valid_pixels = img_masked[mask]
+    img_min = np.min(valid_pixels)
+    img_max = np.max(valid_pixels)
+    
+    img_norm = (img_masked - img_min) / (img_max - img_min + 1e-8)
+    return img_norm, mask
+
+def get_magnetic_proxy(img):
+    """
+    Computes a 'pseudo-magnetic field' orientation map using the Structure Tensor.
+    
+    The Structure Tensor captures local gradient direction and strength.
+    The 'coherence' (anisotropy) measures how directional a region is:
+    - Filaments are elongated -> HIGH coherence
+    - Sunspots/noise are round -> LOW coherence
+    
+    This map guides the Attention Gates to focus on magnetically-aligned structures.
+    
+    Returns:
+        coherence: Normalized 0-1 map where bright = filament-like structure
+    """
+    img_uint8 = (img * 255).astype(np.uint8)
+    
+    # Compute image gradients (Sobel operators)
+    dx = cv2.Sobel(img_uint8, cv2.CV_32F, 1, 0, ksize=3)
+    dy = cv2.Sobel(img_uint8, cv2.CV_32F, 0, 1, ksize=3)
+    
+    # Structure Tensor components (blurred to capture local neighborhood)
+    ksize, sigma = 15, 5
+    Jxx = cv2.GaussianBlur(dx**2, (ksize, ksize), sigma)
+    Jxy = cv2.GaussianBlur(dx * dy, (ksize, ksize), sigma)
+    Jyy = cv2.GaussianBlur(dy**2, (ksize, ksize), sigma)
+    
+    # Coherence (Anisotropy) = sqrt((Jxx - Jyy)^2 + 4*Jxy^2)
+    # This measures how "directional" the local structure is
+    coherence = np.sqrt((Jxx - Jyy)**2 + 4 * Jxy**2)
+    
+    # Normalize to 0-1
+    coherence = (coherence - coherence.min()) / (coherence.max() - coherence.min() + 1e-8)
+    return coherence
+
+# %% [code] {"execution":{"iopub.status.busy":"2026-10-17T10:17:42.408949Z","iopub.execute_input":"2026-10-17T10:17:42.409278Z","iopub.status.idle":"2026-10-17T10:17:42.431490Z","shell.execute_reply.started":"2026-10-17T10:17:42.409260Z","shell.execute_reply":"2026-10-17T10:17:42.430710Z"}}
+# CELL 4: PyTorch Dataset class (FIXED FOR STRING IDs)
+# FIX: Bypasses pycocotools' buggy loadImgs() and getAnnIds() functions
+# by directly accessing the underlying coco.imgs and coco.imgToAnns dictionaries.
+# This prevents the "isArrayLike" bug where strings are iterated character-by-character.
+
+class SolarDataset(Dataset):
+    def __init__(self, coco, img_ids, img_dir, img_size=512, transforms=None):
+        self.coco = coco
+        self.img_ids = img_ids
+        self.img_dir = img_dir
+        self.img_size = img_size
+        self.transforms = transforms
+
+    def __len__(self):
+        return len(self.img_ids)
+
+    def __getitem__(self, idx):
+        img_id = self.img_ids[idx]
+        
+        # FIX 1: Direct dictionary access (avoids loadImgs string bug)
+        img_info = self.coco.imgs[img_id]
+        file_name = img_info['file_name']
+        img_path = os.path.join(self.img_dir, file_name)
+        
+        # Load and normalize image
+        img = load_image(img_path)
+        if img is None:
+            raise FileNotFoundError(f'Cannot read training image: {img_path}')
+        
+        img = (img - img.min()) / (img.max() - img.min() + 1e-8)
+        
+        # Apply preprocessing
+        img_limb, _ = remove_limb_darkening(img)
+        mag_map = get_magnetic_proxy(img_limb)
+        
+        # Stack into 3 channels: [H-alpha, H-alpha, Magnetic Map]
+        img_3ch = np.stack([img_limb, img_limb, mag_map], axis=-1).astype(np.float32)
+        img_3ch = cv2.resize(img_3ch, (self.img_size, self.img_size))
+        
+        # FIX 2: Direct dictionary access for annotations
+        # coco.imgToAnns maps image_id directly to a list of annotation dicts
+        anns = self.coco.imgToAnns.get(img_id, [])
+        
+        # Create combined binary mask at original 2048x2048 resolution
+        mask_2048 = np.zeros((2048, 2048), dtype=np.float32)
+        for ann in anns:
+            # annToMask handles the polygon_list format perfectly
+            m = self.coco.annToMask(ann)
+            mask_2048 = np.maximum(mask_2048, m)
+        
+        # Resize mask to training size
+        mask = cv2.resize(mask_2048, (self.img_size, self.img_size))
+        mask = (mask > 0.5).astype(np.float32)
+        
+        # Apply augmentations
+        if self.transforms:
+            aug = self.transforms(image=img_3ch, mask=mask)
+            img_3ch = aug['image']
+            mask = aug['mask']
+        
+        # Ensure correct tensor shapes regardless of whether transforms were applied
+        # After ToTensorV2(): img is already (C, H, W), mask is (H, W)
+        if isinstance(img_3ch, np.ndarray):
+            img_3ch = torch.from_numpy(img_3ch).permute(2, 0, 1).float()
+        else:
+            img_3ch = img_3ch.float()
+            
+        if isinstance(mask, np.ndarray):
+            mask = torch.from_numpy(mask).unsqueeze(0).float()
+        else:
+            mask = mask.unsqueeze(0).float()
+        
+        return img_3ch, mask
+
+# Define augmentation pipelines (Keep these below the class)
+train_transforms = A.Compose([
+    A.HorizontalFlip(p=0.5),
+    A.VerticalFlip(p=0.5),
+    A.RandomRotate90(p=0.5),
+    ToTensorV2()
+])
+
+val_transforms = A.Compose([
+    ToTensorV2()
+])
+
+# %% [code] {"execution":{"iopub.status.busy":"2026-10-17T10:17:42.432413Z","iopub.execute_input":"2026-10-17T10:17:42.432981Z","iopub.status.idle":"2026-10-17T10:17:42.454441Z","shell.execute_reply.started":"2026-10-17T10:17:42.432955Z","shell.execute_reply":"2026-10-17T10:17:42.453675Z"}}
+# CELL 5: Mag-Agent U²-Net Model Architecture
+# Based on the paper "Automated High-Precision Recognition of Solar Filaments
+# Based on an Improved U2-Net" (Jiang & Li, 2024)
+#
+# Architecture components:
+# 1. AttentionGate: Suppresses irrelevant features, enhances filament response
+# 2. RSU (Residual U-block): Multi-scale feature extraction (from U²-Net)
+# 3. CognitiveRefiner: Bridges fragmented filament pieces using magnetic map
+# 4. MagAgentU2Net: Full encoder-decoder combining all components
+
+# --- 1. Attention Gate ---
+# From Attention U-Net (Oktay et al.)
+# Receives low-level features (encoder) and high-level features (decoder).
+# Computes attention weights to suppress background and enhance filaments.
+class AttentionGate(nn.Module):
+    def __init__(self, F_g, F_l, F_int):
+        """
+        Args:
+            F_g: Channels of gating signal (from decoder)
+            F_l: Channels of input features (from encoder skip connection)
+            F_int: Intermediate channels for attention computation
+        """
+        super().__init__()
+        self.W_g = nn.Sequential(nn.Conv2d(F_g, F_int, 1), nn.BatchNorm2d(F_int))
+        self.W_x = nn.Sequential(nn.Conv2d(F_l, F_int, 1), nn.BatchNorm2d(F_int))
+        self.psi = nn.Sequential(nn.Conv2d(F_int, 1, 1), nn.BatchNorm2d(1), nn.Sigmoid())
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, g, x):
+        """
+        Args:
+            g: Gating signal (from deeper decoder layer)
+            x: Skip connection features (from encoder)
+        Returns:
+            Attention-weighted features
+        """
+        g1 = self.W_g(g)
+        x1 = self.W_x(x)
+        g1 = F.interpolate(g1, size=x1.shape[2:], mode='bilinear', align_corners=True)
+        psi = self.relu(g1 + x1)
+        psi = self.psi(psi)  # Sigmoid -> attention weights [0, 1]
+        return x * psi  # Weight the skip connection features
+
+
+# --- 2. RSU Block (Residual U-block) ---
+# From U²-Net (Qin et al., 2020)
+# A "small U-Net" inside the main U-Net. Captures multi-scale context.
+# Each RSU has an encoder-decoder structure with residual connection.
+class RSU(nn.Module):
+    def __init__(self, in_ch, mid_ch, out_ch):
+        """
+        Args:
+            in_ch: Input channels
+            mid_ch: Intermediate channels (bottleneck)
+            out_ch: Output channels
+        """
+        super().__init__()
+        self.conv_in = nn.Conv2d(in_ch, out_ch, 1)
+        
+        # Encoder path of the mini U-Net
+        self.enc1 = nn.Sequential(
+            nn.Conv2d(out_ch, mid_ch, 3, padding=1),
+            nn.BatchNorm2d(mid_ch), nn.ReLU(inplace=True)
+        )
+        self.pool = nn.MaxPool2d(2)
+        self.enc2 = nn.Sequential(
+            nn.Conv2d(mid_ch, mid_ch, 3, padding=1),
+            nn.BatchNorm2d(mid_ch), nn.ReLU(inplace=True)
+        )
+        
+        # Decoder path of the mini U-Net
+        self.dec2 = nn.Sequential(
+            nn.Conv2d(mid_ch, mid_ch, 3, padding=1),
+            nn.BatchNorm2d(mid_ch), nn.ReLU(inplace=True)
+        )
+        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.dec1 = nn.Sequential(
+            nn.Conv2d(mid_ch * 2, out_ch, 3, padding=1),
+            nn.BatchNorm2d(out_ch), nn.ReLU(inplace=True)
+        )
+        
+    def forward(self, x):
+        x_in = self.conv_in(x)
+        
+        # Encode
+        e1 = self.enc1(x_in)
+        e2 = self.enc2(self.pool(e1))
+        
+        # Decode
+        d2 = self.dec2(e2)
+        d1 = self.dec1(torch.cat([self.up(d2), e1], dim=1))
+        
+        # Residual connection: local + multi-scale features
+        return d1 + x_in
+
+
+# --- 3. Agentic Cognitive Layer (Topology Refiner) ---
+# This is our custom addition to solve the Panoptic Quality fragmentation problem.
+# Standard CNNs often break filaments into multiple pieces.
+# This layer uses dilated convolutions to "see" larger context and
+# bridges gaps between fragmented pieces, guided by the magnetic map.
+class CognitiveRefiner(nn.Module):
+    def __init__(self, in_ch):
+        """
+        Args:
+            in_ch: Number of input channels (features from decoder)
+        """
+        super().__init__()
+        # Dilated convolutions to capture long-range spine continuity
+        # These "see" a larger receptive field to connect broken pieces
+        self.bridge1 = nn.Conv2d(in_ch, in_ch, 3, dilation=2, padding=2, groups=in_ch)
+        self.bridge2 = nn.Conv2d(in_ch, in_ch, 3, dilation=4, padding=4, groups=in_ch)
+        
+        # Agent Reasoning Gate: uses magnetic map to decide WHERE to connect
+        # If magnetic flow is strong between two fragments, connect them
+        self.gate = nn.Sequential(
+            nn.Conv2d(in_ch + 1, in_ch, 1),  # +1 for magnetic map channel
+            nn.Sigmoid()
+        )
+        self.out_conv = nn.Conv2d(in_ch, 1, 1)
+
+    def forward(self, x, mag_map):
+        """
+        Args:
+            x: Feature map from decoder [B, C, H, W]
+            mag_map: Magnetic orientation map [B, 1, H, W]
+        Returns:
+            Refined single-channel prediction [B, 1, H, W]
+        """
+        # Bridge gaps using dilated convolutions
+        b1 = F.relu(self.bridge1(x))
+        b2 = F.relu(self.bridge2(x))
+        bridged = x + b1 + b2  # Residual: original + local bridge + long bridge
+        
+        # Gate based on magnetic alignment
+        # The agent "reasons": if magnetic flow connects two regions, merge them
+        g = self.gate(torch.cat([bridged, mag_map], dim=1))
+        refined = bridged * g
+        
+        return self.out_conv(refined)
+
+
+# --- 4. Full Mag-Agent U²-Net ---
+class MagAgentU2Net(nn.Module):
+    def __init__(self, in_ch=3, out_ch=1):
+        """
+        Args:
+            in_ch: Input channels (3: H-alpha, H-alpha, Magnetic Map)
+            out_ch: Output channels (1: binary segmentation mask)
+        """
+        super().__init__()
+        
+        # === ENCODER ===
+        # ponytail: fixed half-width backbone; compare wider models only after this baseline.
+        self.enc1 = RSU(in_ch, 16, 32)
+        self.pool1 = nn.MaxPool2d(2)
+        self.enc2 = RSU(32, 32, 64)
+        self.pool2 = nn.MaxPool2d(2)
+        self.enc3 = RSU(64, 64, 128)
+        self.pool3 = nn.MaxPool2d(2)
+        
+        # === BOTTLENECK ===
+        self.bottleneck = RSU(128, 128, 256)
+        
+        # === DECODER with Attention Gates ===
+        self.up3 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.att3 = AttentionGate(256, 128, 128)
+        self.dec3 = RSU(384, 128, 128)
+        
+        self.up2 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.att2 = AttentionGate(128, 64, 64)
+        self.dec2 = RSU(192, 64, 64)
+        
+        self.up1 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.att1 = AttentionGate(64, 32, 32)
+        self.dec1 = RSU(96, 32, 32)
+        
+        # === AGENTIC COGNITIVE LAYER ===
+        self.cognitive = CognitiveRefiner(32)
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor [B, 3, H, W]
+        Returns:
+            Segmentation logits [B, 1, H, W]
+        """
+        # Extract magnetic map (channel 2) for the Cognitive Layer
+        mag_map = x[:, 2:3, :, :]
+        
+        # Encoder path
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool1(e1))
+        e3 = self.enc3(self.pool2(e2))
+        
+        # Bottleneck
+        b = self.bottleneck(self.pool3(e3))
+        
+        # Decoder path with Attention Gates
+        d3 = self.up3(b)
+        d3 = self.dec3(torch.cat([d3, self.att3(b, e3)], dim=1))
+        
+        d2 = self.up2(d3)
+        d2 = self.dec2(torch.cat([d2, self.att2(d3, e2)], dim=1))
+        
+        d1 = self.up1(d2)
+        d1 = self.dec1(torch.cat([d1, self.att1(d2, e1)], dim=1))
+        
+        # Agentic Cognitive Refinement
+        out = self.cognitive(d1, mag_map)
+        
+        return out
+
+# %% [code] {"execution":{"iopub.status.busy":"2026-10-17T10:17:42.455368Z","iopub.execute_input":"2026-10-17T10:17:42.455610Z","iopub.status.idle":"2026-10-17T10:17:42.470128Z","shell.execute_reply.started":"2026-10-17T10:17:42.455593Z","shell.execute_reply":"2026-10-17T10:17:42.469456Z"}}
+# CELL 6: Combined Dice + BCE Loss Function
+# Dice Loss: Handles severe class imbalance (filaments are <5% of pixels)
+# BCE Loss: Provides stable gradients for precise boundary detection
+# Combined: dice_loss + bce_loss gives best results for thin structures
+
+class DiceBCELoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.bce = nn.BCEWithLogitsLoss()
+
+    def forward(self, logits, targets):
+        """
+        Args:
+            logits: Raw model output (before sigmoid) [B, 1, H, W]
+            targets: Ground truth binary mask [B, 1, H, W]
+        Returns:
+            Combined loss scalar
+        """
+        # Dice Loss
+        probs = torch.sigmoid(logits.float())
+        smooth = 1.0
+        iflat = probs.view(-1)
+        tflat = targets.float().view(-1)
+        intersection = (iflat * tflat).sum()
+        dice_loss = 1 - ((2. * intersection + smooth) / 
+                         (iflat.sum() + tflat.sum() + smooth))
+        
+        # BCE Loss (with logits - numerically stable)
+        bce_loss = self.bce(logits, targets)
+        
+        return dice_loss + bce_loss
+
+# %% [code] {"execution":{"iopub.status.busy":"2026-10-17T10:17:42.470986Z","iopub.execute_input":"2026-10-17T10:17:42.471330Z","iopub.status.idle":"2026-10-17T10:17:42.487967Z","shell.execute_reply.started":"2026-10-17T10:17:42.471300Z","shell.execute_reply":"2026-10-17T10:17:42.487125Z"}}
+# CELL 7: Training and Validation Loops
+# Uses Automatic Mixed Precision (AMP) for:
+#   - 2x faster training on modern GPUs
+#   - Reduced activation memory for the 512x512 experiment
+# Gradient clipping prevents exploding gradients with BCE loss.
+
+def train_epoch(model, loader, optimizer, criterion, scaler):
+    """Train for one epoch. Returns average loss."""
+    model.train()
+    epoch_loss = 0
+    
+    for images, masks in tqdm(loader, desc="Training"):
+        images = images.to(Config.DEVICE)
+        masks = masks.to(Config.DEVICE)
+        
+        optimizer.zero_grad()
+        
+        # Mixed precision forward pass
+        with autocast():
+            logits = model(images)
+            loss = criterion(logits, masks)
+        
+        # Scaled backward pass
+        scaler.scale(loss).backward()
+        
+        # Gradient clipping (prevents exploding gradients)
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        
+        scaler.step(optimizer)
+        scaler.update()
+        
+        epoch_loss += loss.item()
+    
+    return epoch_loss / len(loader)
+
+def validate(model, loader, criterion):
+    """Return average loss and mean per-image foreground Dice (not competition PQ)."""
+    model.eval()
+    epoch_loss = 0
+    dice_sum = 0.0
+    image_count = 0
+    
+    with torch.no_grad():
+        for images, masks in tqdm(loader, desc="Validating"):
+            images = images.to(Config.DEVICE)
+            masks = masks.to(Config.DEVICE)
+            
+            with autocast():
+                logits = model(images)
+                loss = criterion(logits, masks)
+            
+            epoch_loss += loss.item()
+            preds = (torch.sigmoid(logits.float()) > Config.THRESHOLD).float()
+            dims = (1, 2, 3)
+            dice = (2 * (preds * masks).sum(dims) + 1e-6) / (
+                preds.sum(dims) + masks.sum(dims) + 1e-6)
+            dice_sum += dice.sum().item()
+            image_count += images.size(0)
+    
+    return epoch_loss / len(loader), dice_sum / image_count
+
+
+def fit_model(train_loader, val_loader, lr, weight_decay, epochs, trial=None):
+    """Use identical initialization for each trial; save weights only for the final run."""
+    random.seed(Config.SEED)
+    np.random.seed(Config.SEED)
+    torch.manual_seed(Config.SEED)
+    model = MagAgentU2Net().to(Config.DEVICE)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    criterion = DiceBCELoss()
+    scaler = GradScaler(enabled=Config.DEVICE == 'cuda')
+    best_dice = -1.0
+    history = []
+    print(f'Parameters: {sum(p.numel() for p in model.parameters()):,}; '
+          f'size: {Config.IMG_SIZE}; batch: {Config.BATCH_SIZE}; lr: {lr:.2g}; wd: {weight_decay:.2g}')
+    try:
+        for epoch in range(epochs):
+            if Config.DEVICE == 'cuda':
+                torch.cuda.reset_peak_memory_stats()
+            started = time.perf_counter()
+            train_loss = train_epoch(model, train_loader, optimizer, criterion, scaler)
+            val_loss, dice = validate(model, val_loader, criterion)
+            if not np.isfinite([train_loss, val_loss, dice]).all():
+                raise RuntimeError('Non-finite training or validation result')
+            peak_gib = torch.cuda.max_memory_allocated() / 2**30 if Config.DEVICE == 'cuda' else 0.0
+            seconds = time.perf_counter() - started
+            print(f'Epoch {epoch + 1}/{epochs}: train={train_loss:.4f}, val={val_loss:.4f}, '
+                  f'foreground Dice={dice:.4f}, {seconds:.1f}s, peak allocated={peak_gib:.2f} GiB')
+            history.append(dict(epoch=epoch + 1, train_loss=train_loss, val_loss=val_loss,
+                                foreground_dice=dice, seconds=seconds, peak_allocated_gib=peak_gib))
+            if dice > best_dice:
+                best_dice = dice
+                if trial is None:
+                    torch.save(model.state_dict(), os.path.join(Config.OUT_DIR, 'best_lightweight.pth'))
+            if trial is not None:
+                trial.report(dice, epoch)
+                if trial.should_prune():
+                    raise optuna.TrialPruned()
+            else:
+                pd.DataFrame(history).to_csv(os.path.join(Config.OUT_DIR, 'lightweight_history.csv'), index=False)
+        return best_dice
+    finally:
+        del model, optimizer, scaler
+        gc.collect()
+        if Config.DEVICE == 'cuda':
+            torch.cuda.empty_cache()
+
+# %% [code] {"execution":{"iopub.status.busy":"2026-10-17T10:17:42.489156Z","iopub.execute_input":"2026-10-17T10:17:42.489499Z","iopub.status.idle":"2026-10-17T10:17:42.510437Z","shell.execute_reply.started":"2026-10-17T10:17:42.489473Z","shell.execute_reply":"2026-10-17T10:17:42.509794Z"}}
+# CELL 8: Inference and Kaggle Submission Generator
+# This cell:
+# 1. Runs the trained model on all test images
+# 2. Upscales predictions from Config.IMG_SIZE back to 2048x2048
+# 3. Uses Connected Components to separate individual filaments
+# 4. Filters out tiny noise (< MIN_AREA pixels)
+# 5. Encodes each filament mask as RLE using pycocotools
+# 6. Saves submission.csv in the exact format required by the competition
+#
+# Competition format:
+#   filament_id | segmentation_rle
+#   20150125172714Mh_1 | <RLE string>
+#   20150125172714Mh_2 | <RLE string>
+
+def pycoco_rle_encode(img):
+    """
+    Encodes a binary mask to pycocotools RLE format (ASCII string).
+    This is the exact format required by the competition.
+    
+    Args:
+        img: Binary numpy array (0/1) of shape [H, W]
+    Returns:
+        RLE counts as ASCII string
+    """
+    rle = maskUtils.encode(np.asfortranarray(img.astype(np.uint8)))
+    return rle['counts'].decode('utf-8')
+
+def generate_submission(model, test_paths, out_path):
+    """
+    Generate Kaggle submission CSV from trained model.
+    
+    Args:
+        model: Trained MagAgentU2Net model
+        test_paths: List of test image file paths
+        out_path: Output path for submission.csv
+    """
+    model.eval()
+    submissions = []
+    
+    with torch.no_grad():
+        for img_path in tqdm(test_paths, desc="Generating Submission"):
+            # Extract image ID from filename (e.g., "20220621185332Bh")
+            base_id = os.path.basename(img_path).split('.')[0]
+            
+            # Load and preprocess
+            img = load_image(img_path)
+            if img is None:
+                raise FileNotFoundError(f'Cannot read test image: {img_path}')
+            
+            img = (img - img.min()) / (img.max() - img.min() + 1e-8)
+            img_limb, _ = remove_limb_darkening(img)
+            mag_map = get_magnetic_proxy(img_limb)
+            
+            # Create 3-channel input
+            img_3ch = np.stack([img_limb, img_limb, mag_map], axis=-1).astype(np.float32)
+            img_1024 = cv2.resize(img_3ch, (Config.IMG_SIZE, Config.IMG_SIZE))
+            
+            # Convert to tensor and predict
+            tensor = torch.tensor(img_1024).permute(2, 0, 1).unsqueeze(0).to(Config.DEVICE)
+            
+            with autocast():
+                logits = model(tensor)
+            
+            # Threshold and upscale to original 2048x2048
+            pred_mask_1024 = (torch.sigmoid(logits) > Config.THRESHOLD).cpu().numpy().squeeze()
+            pred_mask_2048 = cv2.resize(
+                pred_mask_1024.astype(np.uint8),
+                (Config.ORIGINAL_SIZE, Config.ORIGINAL_SIZE),
+                interpolation=cv2.INTER_NEAREST
+            )
+            
+            # Connected Components: separate individual filaments
+            # This is CRITICAL for Panoptic Quality (avoids over-merging)
+            num_labels, labels_im = cv2.connectedComponents(pred_mask_2048)
+            
+            for i in range(1, num_labels):  # Skip 0 (background)
+                component_mask = (labels_im == i).astype(np.uint8)
+                
+                # Filter out tiny noise fragments
+                # This improves PQ by reducing false positives
+                if component_mask.sum() < Config.MIN_AREA:
+                    continue
+                
+                # Encode to RLE format required by competition
+                rle_str = pycoco_rle_encode(component_mask)
+                fil_id = f"{base_id}_{i}"
+                submissions.append({
+                    'filament_id': fil_id,
+                    'segmentation_rle': rle_str
+                })
+    
+    # Save submission CSV
+    df = pd.DataFrame(submissions, columns=['filament_id', 'segmentation_rle'])
+    df.to_csv(out_path, index=False)
+    print(f"\nSubmission saved to {out_path}")
+    print(f"Total filaments detected: {len(df)}")
+    print(f"Unique images: {df['filament_id'].str.rsplit('_', n=1).str[0].nunique()}")
+
+# %% [code] {"execution":{"iopub.status.busy":"2026-10-17T10:17:42.512338Z","iopub.execute_input":"2026-10-17T10:17:42.512631Z","iopub.status.idle":"2026-10-17T10:17:48.428416Z","shell.execute_reply.started":"2026-10-17T10:17:42.512613Z","shell.execute_reply":"2026-10-17T10:17:48.427243Z"}}
+# CELL 9: Main Execution Pipeline
+# This cell orchestrates the entire workflow:
+# 1. Load COCO annotations JSON
+# 2. Split images into train (80%) and validation (20%)
+# 3. Create DataLoaders with augmentations
+# 4. Initialize Mag-Agent U²-Net model
+# 5. Run short Optuna trials, then train the winner and save its best Dice checkpoint
+# 6. Load best model and generate Kaggle submission
+
+# CELL 9: Main Execution Pipeline (FIXED FOR STRING IDs)
+# FIX: Extracts string IDs directly from coco.imgs.keys() instead of getImgIds()
+
+def main():
+    os.makedirs(Config.OUT_DIR, exist_ok=True)
+    # === 1. Load COCO Annotations ===
+    print("=" * 60)
+    print("Loading COCO annotations...")
+    coco = COCO(Config.ANNOTATIONS_FILE)
+    
+    # FIX 3: Get string IDs directly from the imgs dictionary keys
+    all_img_ids = list(coco.imgs.keys())
+    print(f"Total images in JSON: {len(all_img_ids)}")
+    
+    # Filter to only images that actually exist on disk
+    valid_img_ids = []
+    for img_id in all_img_ids:
+        file_name = coco.imgs[img_id]['file_name']
+        img_path = os.path.join(Config.TRAIN_DIR, file_name)
+        if os.path.exists(img_path):
+            valid_img_ids.append(img_id)
+            
+    print(f"Found {len(valid_img_ids)} valid training images on disk.")
+    print(f"Total annotations: {len(coco.dataset.get('annotations', []))}")
+    print("=" * 60)
+    
+    # === 2. Train/Val Split (80/20) ===
+    split_idx = int(0.8 * len(valid_img_ids))
+    if not 0 < split_idx < len(valid_img_ids):
+        raise ValueError('Need at least two readable training images for train/validation split')
+    train_ids = valid_img_ids[:split_idx]
+    val_ids = valid_img_ids[split_idx:]
+    
+    print(f"Training images: {len(train_ids)}")
+    print(f"Validation images: {len(val_ids)}")
+    
+    # === 3. Create Datasets and DataLoaders ===
+    train_ds = SolarDataset(coco, train_ids, Config.TRAIN_DIR, Config.IMG_SIZE, train_transforms)
+    val_ds = SolarDataset(coco, val_ids, Config.TRAIN_DIR, Config.IMG_SIZE, val_transforms)
+    
+    train_loader = DataLoader(
+        train_ds, batch_size=Config.BATCH_SIZE, shuffle=True,
+        num_workers=Config.NUM_WORKERS, pin_memory=True
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=Config.BATCH_SIZE, shuffle=False,
+        num_workers=Config.NUM_WORKERS, pin_memory=True
+    )
+    
+    # === 4. Short sequential search; trial 0 is the untuned baseline ===
+    # ponytail: tune only optimizer settings; keep architecture/resolution/split fixed.
+    study = optuna.create_study(
+        direction='maximize', sampler=optuna.samplers.TPESampler(seed=Config.SEED, n_startup_trials=3),
+        pruner=optuna.pruners.MedianPruner(n_startup_trials=2, n_warmup_steps=1))
+    study.enqueue_trial({'lr': Config.LR, 'weight_decay': Config.WEIGHT_DECAY})
+
+    def objective(trial):
+        lr = trial.suggest_float('lr', 5e-5, 1e-3, log=True)
+        weight_decay = trial.suggest_float('weight_decay', 1e-6, 1e-3, log=True)
+        return fit_model(train_loader, val_loader, lr, weight_decay, Config.TRIAL_EPOCHS, trial)
+
+    study.optimize(objective, n_trials=Config.N_TRIALS, n_jobs=1, gc_after_trial=True)
+    study.trials_dataframe().to_csv(os.path.join(Config.OUT_DIR, 'optuna_trials.csv'), index=False)
+    print(f'Best short-trial foreground Dice: {study.best_value:.4f}; {study.best_params}')
+
+    # === 5. Fresh, longer training with the selected optimizer settings ===
+    fit_model(train_loader, val_loader, **study.best_params, epochs=Config.EPOCHS)
+    model_path = os.path.join(Config.OUT_DIR, 'best_lightweight.pth')
+    
+    # === 6. Generate Submission ===
+    print("\n" + "=" * 60)
+    print("Generating Kaggle submission...")
+    model = MagAgentU2Net().to(Config.DEVICE)
+    model.load_state_dict(torch.load(model_path, map_location=Config.DEVICE, weights_only=True))
+    
+    test_imgs = sorted(glob.glob(os.path.join(Config.TEST_DIR, '*.jpeg')))
+    print(f"Found {len(test_imgs)} test images.")
+    
+    submission_path = os.path.join(Config.OUT_DIR, 'submission.csv')
+    generate_submission(model, test_imgs, submission_path)
+    
+    print("\n" + "=" * 60)
+    print("PIPELINE COMPLETE!")
+    print(f"Submission file: {submission_path}")
+    print("=" * 60)
+
+# Run the pipeline
+main()
+
+# %% [code] {"execution":{"iopub.status.busy":"2026-10-17T10:17:48.429154Z","iopub.status.idle":"2026-10-17T10:17:48.429410Z","shell.execute_reply.started":"2026-10-17T10:17:48.429294Z","shell.execute_reply":"2026-10-17T10:17:48.429307Z"}}
+# CELL 10: Optional - Visualize Sample Predictions
+# This cell shows a few example predictions overlaid on the original images
+# so you can visually verify the model quality before submitting.
+
+def visualize_predictions(model, coco, img_ids, img_dir, num_samples=4):
+    """Display sample predictions for visual verification."""
+    model.eval()
+    fig, axes = plt.subplots(num_samples, 3, figsize=(18, 6 * num_samples))
+    
+    if num_samples == 1:
+        axes = axes[np.newaxis, :]
+    
+    with torch.no_grad():
+        for i, img_id in enumerate(img_ids[:num_samples]):
+            img_info = coco.imgs[img_id]
+            img_path = os.path.join(img_dir, img_info['file_name'])
+            
+            # Load and preprocess
+            img = load_image(img_path)
+            img = (img - img.min()) / (img.max() - img.min() + 1e-8)
+            img_limb, _ = remove_limb_darkening(img)
+            mag_map = get_magnetic_proxy(img_limb)
+            
+            img_3ch = np.stack([img_limb, img_limb, mag_map], axis=-1).astype(np.float32)
+            img_1024 = cv2.resize(img_3ch, (Config.IMG_SIZE, Config.IMG_SIZE))
+            tensor = torch.tensor(img_1024).permute(2, 0, 1).unsqueeze(0).to(Config.DEVICE)
+            
+            with autocast():
+                logits = model(tensor)
+            
+            pred = (torch.sigmoid(logits) > Config.THRESHOLD).cpu().numpy().squeeze()
+            
+            # Get ground truth mask
+            anns = coco.imgToAnns.get(img_id, [])
+            gt_mask = np.zeros((Config.IMG_SIZE, Config.IMG_SIZE), dtype=np.float32)
+            for ann in anns:
+                m = coco.annToMask(ann)
+                m = cv2.resize(m, (Config.IMG_SIZE, Config.IMG_SIZE))
+                gt_mask = np.maximum(gt_mask, m)
+            
+            # Plot
+            axes[i, 0].imshow(img_limb, cmap='gray')
+            axes[i, 0].set_title(f'Original: {img_info["file_name"]}')
+            axes[i, 0].axis('off')
+            
+            axes[i, 1].imshow(gt_mask, cmap='gray')
+            axes[i, 1].set_title('Ground Truth')
+            axes[i, 1].axis('off')
+            
+            axes[i, 2].imshow(pred, cmap='gray')
+            axes[i, 2].set_title('Prediction')
+            axes[i, 2].axis('off')
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(Config.OUT_DIR, 'predictions.png'), dpi=150)
+    plt.show()
+
+# Run visualization (uses the trained model)
+# Uncomment after training is complete:
+# model = MagAgentU2Net(in_ch=Config.IN_CHANNELS).to(Config.DEVICE)
+# model.load_state_dict(torch.load(os.path.join(Config.OUT_DIR, 'best_lightweight.pth')))
+# coco = COCO(Config.ANNOTATIONS_FILE)
+# visualize_predictions(model, coco, coco.getImgIds()[:4], Config.TRAIN_DIR)

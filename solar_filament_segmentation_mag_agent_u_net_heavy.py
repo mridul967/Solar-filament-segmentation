@@ -8,6 +8,10 @@
 !pip install optuna albumentations pycocotools timm -q
 
 import os
+# Must be set before importing torch. This reduces allocator fragmentation for
+# the large, temporary feature maps produced by 1024x1024 RSU blocks.
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+
 import glob
 import numpy as np
 import pandas as pd
@@ -21,7 +25,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from torch.cuda.amp import autocast, GradScaler
 
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
@@ -57,7 +60,10 @@ class Config:
     ORIGINAL_SIZE = 2048
     
     # === TRAINING HYPERPARAMETERS ===
-    BATCH_SIZE = 4        # Keep small for 1024x1024 images on Kaggle GPUs
+    # Two T4s receive one image each; two optimizer steps are accumulated so
+    # the effective batch size remains 4 without changing the architecture.
+    BATCH_SIZE = 2
+    ACCUM_STEPS = 2
     EPOCHS = 25           # Total training epochs
     LR = 2e-4             # Learning rate (Adam optimizer)
     WEIGHT_DECAY = 1e-4   # L2 regularization
@@ -512,28 +518,37 @@ def train_epoch(model, loader, optimizer, criterion, scaler):
     model.train()
     epoch_loss = 0
     
-    for images, masks in tqdm(loader, desc="Training"):
-        images = images.to(Config.DEVICE)
-        masks = masks.to(Config.DEVICE)
-        
-        optimizer.zero_grad()
+    optimizer.zero_grad(set_to_none=True)
+    remainder = len(loader) % Config.ACCUM_STEPS
+
+    for step, (images, masks) in enumerate(tqdm(loader, desc="Training")):
+        images = images.to(Config.DEVICE, non_blocking=True)
+        masks = masks.to(Config.DEVICE, non_blocking=True)
+
+        # Do not underweight a final, incomplete accumulation group.
+        accumulation_divisor = (
+            remainder
+            if remainder and step >= len(loader) - remainder
+            else Config.ACCUM_STEPS
+        )
         
         # Mixed precision forward pass
-        with autocast():
+        with torch.autocast(device_type='cuda', dtype=torch.float16):
             logits = model(images)
-            loss = criterion(logits, masks)
+            loss = criterion(logits, masks) / accumulation_divisor
         
         # Scaled backward pass
         scaler.scale(loss).backward()
-        
-        # Gradient clipping (prevents exploding gradients)
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        
-        scaler.step(optimizer)
-        scaler.update()
-        
-        epoch_loss += loss.item()
+
+        if (step + 1) % Config.ACCUM_STEPS == 0 or step + 1 == len(loader):
+            # Gradient clipping (prevents exploding gradients)
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+
+        epoch_loss += loss.item() * accumulation_divisor
     
     return epoch_loss / len(loader)
 
@@ -544,10 +559,10 @@ def validate(model, loader, criterion):
     
     with torch.no_grad():
         for images, masks in tqdm(loader, desc="Validating"):
-            images = images.to(Config.DEVICE)
-            masks = masks.to(Config.DEVICE)
+            images = images.to(Config.DEVICE, non_blocking=True)
+            masks = masks.to(Config.DEVICE, non_blocking=True)
             
-            with autocast():
+            with torch.autocast(device_type='cuda', dtype=torch.float16):
                 logits = model(images)
                 loss = criterion(logits, masks)
             
@@ -614,9 +629,11 @@ def generate_submission(model, test_paths, out_path):
             img_1024 = cv2.resize(img_3ch, (Config.IMG_SIZE, Config.IMG_SIZE))
             
             # Convert to tensor and predict
-            tensor = torch.tensor(img_1024).permute(2, 0, 1).unsqueeze(0).to(Config.DEVICE)
+            tensor = torch.tensor(img_1024).permute(2, 0, 1).unsqueeze(0).to(
+                Config.DEVICE, non_blocking=True
+            )
             
-            with autocast():
+            with torch.autocast(device_type='cuda', dtype=torch.float16):
                 logits = model(tensor)
             
             # Threshold and upscale to original 2048x2048
@@ -711,10 +728,14 @@ def main():
     )
     
     # === 4. Initialize Model ===
-    model = MagAgentU2Net(in_ch=Config.IN_CHANNELS, out_ch=Config.OUT_CHANNELS).to(Config.DEVICE)
+    model = MagAgentU2Net(in_ch=Config.IN_CHANNELS, out_ch=Config.OUT_CHANNELS)
+    if torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs with DataParallel")
+        model = nn.DataParallel(model)
+    model = model.to(Config.DEVICE)
     optimizer = torch.optim.AdamW(model.parameters(), lr=Config.LR, weight_decay=Config.WEIGHT_DECAY)
     criterion = DiceBCELoss()
-    scaler = GradScaler()
+    scaler = torch.amp.GradScaler('cuda')
     
     # Print model summary
     total_params = sum(p.numel() for p in model.parameters())
@@ -722,7 +743,9 @@ def main():
     print(f"\nModel Parameters: {total_params:,} total, {trainable_params:,} trainable")
     print(f"Device: {Config.DEVICE}")
     print(f"Image Size: {Config.IMG_SIZE}x{Config.IMG_SIZE}")
-    print(f"Batch Size: {Config.BATCH_SIZE}")
+    print(f"Loader Batch Size: {Config.BATCH_SIZE}")
+    print(f"Gradient Accumulation Steps: {Config.ACCUM_STEPS}")
+    print(f"Effective Batch Size: {Config.BATCH_SIZE * Config.ACCUM_STEPS}")
     print("=" * 60)
     
     # === 5. Training Loop ===
@@ -742,13 +765,17 @@ def main():
         # Save best model
         if val_loss < best_loss:
             best_loss = val_loss
-            torch.save(model.state_dict(), model_path)
+            unwrapped_model = model.module if isinstance(model, nn.DataParallel) else model
+            torch.save(unwrapped_model.state_dict(), model_path)
             print(f"✓ Saved new best model! (val_loss: {val_loss:.4f})")
     
     # === 6. Generate Submission ===
     print("\n" + "=" * 60)
     print("Generating Kaggle submission...")
-    model.load_state_dict(torch.load(model_path))
+    unwrapped_model = model.module if isinstance(model, nn.DataParallel) else model
+    unwrapped_model.load_state_dict(
+        torch.load(model_path, map_location=Config.DEVICE, weights_only=True)
+    )
     
     test_imgs = sorted(glob.glob(os.path.join(Config.TEST_DIR, '*.jpeg')))
     print(f"Found {len(test_imgs)} test images.")
@@ -790,9 +817,11 @@ def visualize_predictions(model, coco, img_ids, img_dir, num_samples=4):
             
             img_3ch = np.stack([img_limb, img_limb, mag_map], axis=-1).astype(np.float32)
             img_1024 = cv2.resize(img_3ch, (Config.IMG_SIZE, Config.IMG_SIZE))
-            tensor = torch.tensor(img_1024).permute(2, 0, 1).unsqueeze(0).to(Config.DEVICE)
+            tensor = torch.tensor(img_1024).permute(2, 0, 1).unsqueeze(0).to(
+                Config.DEVICE, non_blocking=True
+            )
             
-            with autocast():
+            with torch.autocast(device_type='cuda', dtype=torch.float16):
                 logits = model(tensor)
             
             pred = (torch.sigmoid(logits) > Config.THRESHOLD).cpu().numpy().squeeze()

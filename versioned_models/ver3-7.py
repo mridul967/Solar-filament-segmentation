@@ -268,7 +268,7 @@ def generate_submission(model,paths):
 # CELL 10: Run full V3-V7 pipeline
 def records_for(cases,names):return [dict(file_name=c['file_name'],image_id=i) for c in cases if c['file_name'] in set(names) for i in c['image_ids']]
 def preflight():
-    model=MagAgentU2Net().to(Config.DEVICE);out=model(torch.randn(1,3,64,64,device=Config.DEVICE));assert set(out)=={'fg','boundary','spine'} and all(v.shape==(1,1,64,64) for v in out.values());assert official_stats([np.ones((4,4),np.uint8)],[np.ones((4,4),np.uint8)])['pq']==1.;assert official_stats([],[])['pq']==0.;del model;print('Preflight passed.')
+    model=MagAgentU2Net().to(Config.DEVICE);out=model(torch.randn(1,3,64,64,device=Config.DEVICE));assert set(out)=={'fg','boundary','spine'} and all(v.shape==(1,1,64,64) for v in out.values());assert finalize(official_stats([np.ones((4,4),np.uint8)],[np.ones((4,4),np.uint8)]))['pq']==1.;assert finalize(official_stats([],[]))['pq']==0.;del model;print('Preflight passed.')
 def main():
     random.seed(Config.SEED);np.random.seed(Config.SEED);torch.manual_seed(Config.SEED)
     if Config.RUN_PREFLIGHT:preflight()

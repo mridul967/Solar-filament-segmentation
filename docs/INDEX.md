@@ -9,6 +9,7 @@ Repository documentation navigation. Paths are relative to this index; line anch
 | [context.md](../context.md) | `context.md` | Research, Data & Datasets, ML Workflow | 1690 | Competition goals, data contracts, Mag-Agent U²-Net pipeline, known issues, and deliverables. |
 | [README.md](../README.md) | `README.md` | Project Overview | 0 | Empty project README. |
 | [reductions.md](reductions.md) | `docs/reductions.md` | ML Workflow, Experiment Plan | 26 | Verbatim proposal for cheaper models, short Optuna trials, and staged validation. |
+| [masterplan.md](masterplan.md) | `docs/masterplan.md` | ML Architecture, Implementation Plan | 219 | Detailed V3–V7 plan for grouped validation, multi-task topology supervision, training efficiency, calibration, and submission. |
 | [verisoned_models.md](verisoned_models.md) | `docs/verisoned_models.md` | ML Architecture, Research Roadmap | 226 | PQ-oriented V1–V7 implementation plan and supporting research. |
 | [INDEX.md](INDEX.md) | `docs/INDEX.md` | Documentation Navigation | 183 | Registry, heading map, and topic lookup for repository Markdown. |
 
@@ -133,6 +134,17 @@ No Markdown headings; navigate by topic:
 | Subsection | [12. Reproduce useful parts of the solar paper](verisoned_models.md#L201) | Evaluate relevant morphology by PQ. |
 | Section | [Recommended implementation sequence](verisoned_models.md#L214) | V1 through V7 delivery order. |
 
+### docs/masterplan.md
+
+No Markdown headings; navigate by numbered phase:
+
+- [1. Evaluation and grouped split](masterplan.md#L4): Organizer-compatible PQ semantics and leakage-free physical-image partitions.
+- [2. Instance and topology targets](masterplan.md#L29): Foreground, boundary, spine, and skeleton supervision.
+- [3–4. Wider model and loss](masterplan.md#L54): Restored 10M backbone, GroupNorm, three heads, and skeleton-recall objective.
+- [5–6. Efficient training](masterplan.md#L97): Early stopping, Optuna pruning, AMP, accumulation, and two-GPU use.
+- [7–8. Preprocessing and decoding](masterplan.md#L145): Stable solar-disk preprocessing, watershed comparison, and PQ calibration.
+- [9–10. Version staging and delivery](masterplan.md#L184): V3–V7 sequencing, six-hour budget, artifacts, and verification.
+
 ### docs/INDEX.md
 
 - [A. Document Registry Matrix](#L5): Registry and document line counts.
@@ -180,4 +192,5 @@ No Markdown headings; navigate by topic:
 | Threshold tuning, spine supervision, TTA, Optuna | [Future work](../context.md#L1443) | Deferred improvement candidates. |
 | submission.csv, report, repository | [Deliverables](../context.md#L1550) | Competition artifacts. |
 | V1–V7, boundary, spine, clDice, embeddings, watershed | [Versioned model plan](verisoned_models.md#L5) | Research-backed PQ improvement sequence. |
+| Grouped split, official PQ, GroupNorm, skeleton recall, early stopping, watershed calibration | [Master implementation plan](masterplan.md#L4) | Concrete V3–V7 execution plan and training-budget decisions. |
 | Lightweight baseline, half-width, Optuna pruning, staged experiments | [Reduction plan](reductions.md#L1) | Proposed low-cost experiments; later comparisons remain optional. |

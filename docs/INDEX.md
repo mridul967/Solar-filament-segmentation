@@ -9,7 +9,8 @@ Repository documentation navigation. Paths are relative to this index; line anch
 | [context.md](../context.md) | `context.md` | Research, Data & Datasets, ML Workflow | 1690 | Competition goals, data contracts, Mag-Agent U²-Net pipeline, known issues, and deliverables. |
 | [README.md](../README.md) | `README.md` | Project Overview | 0 | Empty project README. |
 | [reductions.md](reductions.md) | `docs/reductions.md` | ML Workflow, Experiment Plan | 26 | Verbatim proposal for cheaper models, short Optuna trials, and staged validation. |
-| [INDEX.md](INDEX.md) | `docs/INDEX.md` | Documentation Navigation | 161 | Registry, heading map, and topic lookup for repository Markdown. |
+| [verisoned_models.md](verisoned_models.md) | `docs/verisoned_models.md` | ML Architecture, Research Roadmap | 226 | PQ-oriented V1–V7 implementation plan and supporting research. |
+| [INDEX.md](INDEX.md) | `docs/INDEX.md` | Documentation Navigation | 183 | Registry, heading map, and topic lookup for repository Markdown. |
 
 ## B. Hierarchical Section & Heading Map
 
@@ -113,11 +114,30 @@ No Markdown headings; navigate by topic:
 - [Optuna experiment sequence](reductions.md#L15): Baseline, short trials, pruning, and longer comparisons.
 - [Evaluation and hardware decision](reductions.md#L23): Foreground Dice, PQ, and validation before renting.
 
+### docs/verisoned_models.md
+
+| Level | Section / Exact Line | Topics |
+|---|---|---|
+| Section | [Proposed plan](verisoned_models.md#L5) | PQ-oriented roadmap from measurement through model and inference improvements. |
+| Subsection | [1. Implement the exact local competition metric first](verisoned_models.md#L7) | PQ, SQ, RQ, matching errors, and metric-driven selection. |
+| Subsection | [2. Repair the validation design](verisoned_models.md#L29) | Seeded stratification and persistent validation membership. |
+| Subsection | [3. Restore useful spatial resolution](verisoned_models.md#L42) | Staged 768 and 1024 experiments. |
+| Subsection | [4. Stop collapsing annotations into one training mask](verisoned_models.md#L54) | Instance, boundary, and spine targets. |
+| Subsection | [5. Add lightweight instance-aware output heads](verisoned_models.md#L68) | Foreground, boundary, spine, and embedding heads. |
+| Subsection | [6. Replace the loss with a topology-aware multi-task objective](verisoned_models.md#L85) | Dice, BCE, clDice, boundary, spine, and embedding losses. |
+| Subsection | [7. Replace plain connected components](verisoned_models.md#L118) | Seeded instance extraction. |
+| Subsection | [8. Tune post-processing directly for PQ](verisoned_models.md#L141) | Cached validation prediction search. |
+| Subsection | [9. Change the Optuna objective](verisoned_models.md#L157) | Optimize PQ and track SQ/RQ. |
+| Subsection | [10. Use augmentations that preserve solar morphology](verisoned_models.md#L177) | Conservative topology-preserving augmentation. |
+| Subsection | [11. Add inference improvements after the base model works](verisoned_models.md#L189) | TTA and optional folds. |
+| Subsection | [12. Reproduce useful parts of the solar paper](verisoned_models.md#L201) | Evaluate relevant morphology by PQ. |
+| Section | [Recommended implementation sequence](verisoned_models.md#L214) | V1 through V7 delivery order. |
+
 ### docs/INDEX.md
 
 - [A. Document Registry Matrix](#L5): Registry and document line counts.
-- [B. Hierarchical Section & Heading Map](#L14): Exact source heading locations and topics.
-- [C. Master Keyword & Topic Search Matrix](#L122): Cross-document topic shortcuts.
+- [B. Hierarchical Section & Heading Map](#L15): Exact source heading locations and topics.
+- [C. Master Keyword & Topic Search Matrix](#L142): Cross-document topic shortcuts.
 
 ## C. Master Keyword & Topic Search Matrix
 
@@ -142,6 +162,7 @@ No Markdown headings; navigate by topic:
 
 | Keywords | Source | Coverage |
 |---|---|---|
+| Local PQ, SQ, RQ, split and merge diagnostics | [V1 metric plan](verisoned_models.md#L7) | Instance-aware validation and selection. |
 | Dice, PQ, TP, FP, FN, IoU | [Metrics](../context.md#L25) | Pixel overlap and instance quality objectives. |
 | Sobel, structure tensor, coherence, limb darkening | [Preprocessing](../context.md#L455) | H-alpha-derived input features. |
 | DiceBCELoss, BCEWithLogitsLoss | [Loss](../context.md#L853) | Training objective. |
@@ -158,4 +179,5 @@ No Markdown headings; navigate by topic:
 | Semantic vs instance, approximate proxy, local PQ | [Limitations](../context.md#L1369) | Current design ceilings. |
 | Threshold tuning, spine supervision, TTA, Optuna | [Future work](../context.md#L1443) | Deferred improvement candidates. |
 | submission.csv, report, repository | [Deliverables](../context.md#L1550) | Competition artifacts. |
+| V1–V7, boundary, spine, clDice, embeddings, watershed | [Versioned model plan](verisoned_models.md#L5) | Research-backed PQ improvement sequence. |
 | Lightweight baseline, half-width, Optuna pruning, staged experiments | [Reduction plan](reductions.md#L1) | Proposed low-cost experiments; later comparisons remain optional. |

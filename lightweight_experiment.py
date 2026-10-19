@@ -9,6 +9,7 @@
 import os
 import glob
 import gc
+import json
 import random
 import time
 import optuna
@@ -36,7 +37,7 @@ print(f"CUDA Available: {torch.cuda.is_available()}")
 if torch.cuda.is_available():
     print(f"GPU: {torch.cuda.get_device_name(0)}")
 
-# %% [code] {"execution":{"iopub.status.busy":"2026-10-17T10:17:42.375853Z","iopub.execute_input":"2026-10-17T10:17:42.376262Z","iopub.status.idle":"2026-10-17T10:17:42.388188Z","shell.execute_reply.started":"2026-10-17T10:17:42.376225Z","shell.execute_reply":"2026-10-17T10:17:42.387494Z"}}
+# %% [code] {"execution":{"iopub.status.busy":"2026-10-17T12:57:29.034503Z","iopub.execute_input":"2026-10-17T12:57:29.035098Z","iopub.status.idle":"2026-10-17T12:57:29.048350Z","shell.execute_reply.started":"2026-10-17T12:57:29.035072Z","shell.execute_reply":"2026-10-17T12:57:29.047500Z"},"jupyter":{"outputs_hidden":false}}
 # CELL 2: Configuration class with exact Kaggle dataset paths
 # These paths were verified from the directory scan output:
 #   /kaggle/input/competitions/filament-segmentation-2026/MAGFiLO_1.0_Kaggle_2026/
@@ -61,9 +62,9 @@ class Config:
     
     # === TRAINING HYPERPARAMETERS ===
     BATCH_SIZE = 2
-    EPOCHS = 10           # Fresh training of the best short-trial configuration
-    N_TRIALS = 6          # Includes the baseline configuration as trial 0
-    TRIAL_EPOCHS = 3
+    EPOCHS = 2           # Fresh training of the best short-trial configuration
+    N_TRIALS = 1          # Includes the baseline configuration as trial 0
+    TRIAL_EPOCHS = 2
     SEED = 42
     LR = 2e-4             # Learning rate (Adam optimizer)
     WEIGHT_DECAY = 1e-4   # L2 regularization
@@ -77,6 +78,8 @@ class Config:
     # === SUBMISSION PARAMETERS ===
     MIN_AREA = 200        # Minimum pixel area to count as a valid filament (filters noise)
     THRESHOLD = 0.4       # Probability threshold for binary mask
+    PQ_IOU_THRESHOLD = 0.5
+    DIAGNOSTIC_IOU_THRESHOLD = 0.1
 
 # Verify paths exist
 print(f"Train dir exists: {os.path.exists(Config.TRAIN_DIR)}")
@@ -85,7 +88,7 @@ print(f"Annotations exist: {os.path.exists(Config.ANNOTATIONS_FILE)}")
 print(f"Train images: {len(glob.glob(os.path.join(Config.TRAIN_DIR, '*.jpeg')))}")
 print(f"Test images:  {len(glob.glob(os.path.join(Config.TEST_DIR, '*.jpeg')))}")
 
-# %% [code] {"execution":{"iopub.status.busy":"2026-10-17T10:17:42.390316Z","iopub.execute_input":"2026-10-17T10:17:42.390722Z","iopub.status.idle":"2026-10-17T10:17:42.407983Z","shell.execute_reply.started":"2026-10-17T10:17:42.390676Z","shell.execute_reply":"2026-10-17T10:17:42.407201Z"}}
+# %% [code] {"execution":{"iopub.status.busy":"2026-10-17T12:57:29.049323Z","iopub.execute_input":"2026-10-17T12:57:29.049638Z","iopub.status.idle":"2026-10-17T12:57:29.065775Z","shell.execute_reply.started":"2026-10-17T12:57:29.049607Z","shell.execute_reply":"2026-10-17T12:57:29.064984Z"},"jupyter":{"outputs_hidden":false}}
 # CELL 3: Preprocessing Engine
 # Two key functions:
 # 1. remove_limb_darkening(): Removes the darkening effect at the Sun's edge
@@ -173,7 +176,7 @@ def get_magnetic_proxy(img):
     coherence = (coherence - coherence.min()) / (coherence.max() - coherence.min() + 1e-8)
     return coherence
 
-# %% [code] {"execution":{"iopub.status.busy":"2026-10-17T10:17:42.408949Z","iopub.execute_input":"2026-10-17T10:17:42.409278Z","iopub.status.idle":"2026-10-17T10:17:42.431490Z","shell.execute_reply.started":"2026-10-17T10:17:42.409260Z","shell.execute_reply":"2026-10-17T10:17:42.430710Z"}}
+# %% [code] {"execution":{"iopub.status.busy":"2026-10-17T12:57:29.068021Z","iopub.execute_input":"2026-10-17T12:57:29.068326Z","iopub.status.idle":"2026-10-17T12:57:29.085043Z","shell.execute_reply.started":"2026-10-17T12:57:29.068307Z","shell.execute_reply":"2026-10-17T12:57:29.084303Z"},"jupyter":{"outputs_hidden":false}}
 # CELL 4: PyTorch Dataset class (FIXED FOR STRING IDs)
 # FIX: Bypasses pycocotools' buggy loadImgs() and getAnnIds() functions
 # by directly accessing the underlying coco.imgs and coco.imgToAnns dictionaries.
@@ -260,7 +263,7 @@ val_transforms = A.Compose([
     ToTensorV2()
 ])
 
-# %% [code] {"execution":{"iopub.status.busy":"2026-10-17T10:17:42.432413Z","iopub.execute_input":"2026-10-17T10:17:42.432981Z","iopub.status.idle":"2026-10-17T10:17:42.454441Z","shell.execute_reply.started":"2026-10-17T10:17:42.432955Z","shell.execute_reply":"2026-10-17T10:17:42.453675Z"}}
+# %% [code] {"execution":{"iopub.status.busy":"2026-10-17T12:57:29.085996Z","iopub.execute_input":"2026-10-17T12:57:29.086316Z","iopub.status.idle":"2026-10-17T12:57:29.110368Z","shell.execute_reply.started":"2026-10-17T12:57:29.086283Z","shell.execute_reply":"2026-10-17T12:57:29.109732Z"},"jupyter":{"outputs_hidden":false}}
 # CELL 5: Mag-Agent U²-Net Model Architecture
 # Based on the paper "Automated High-Precision Recognition of Solar Filaments
 # Based on an Improved U2-Net" (Jiang & Li, 2024)
@@ -474,7 +477,7 @@ class MagAgentU2Net(nn.Module):
         
         return out
 
-# %% [code] {"execution":{"iopub.status.busy":"2026-10-17T10:17:42.455368Z","iopub.execute_input":"2026-10-17T10:17:42.455610Z","iopub.status.idle":"2026-10-17T10:17:42.470128Z","shell.execute_reply.started":"2026-10-17T10:17:42.455593Z","shell.execute_reply":"2026-10-17T10:17:42.469456Z"}}
+# %% [code] {"execution":{"iopub.status.busy":"2026-10-17T12:57:29.111399Z","iopub.execute_input":"2026-10-17T12:57:29.111762Z","iopub.status.idle":"2026-10-17T12:57:29.132426Z","shell.execute_reply.started":"2026-10-17T12:57:29.111730Z","shell.execute_reply":"2026-10-17T12:57:29.131805Z"},"jupyter":{"outputs_hidden":false}}
 # CELL 6: Combined Dice + BCE Loss Function
 # Dice Loss: Handles severe class imbalance (filaments are <5% of pixels)
 # BCE Loss: Provides stable gradients for precise boundary detection
@@ -507,7 +510,7 @@ class DiceBCELoss(nn.Module):
         
         return dice_loss + bce_loss
 
-# %% [code] {"execution":{"iopub.status.busy":"2026-10-17T10:17:42.470986Z","iopub.execute_input":"2026-10-17T10:17:42.471330Z","iopub.status.idle":"2026-10-17T10:17:42.487967Z","shell.execute_reply.started":"2026-10-17T10:17:42.471300Z","shell.execute_reply":"2026-10-17T10:17:42.487125Z"}}
+# %% [code] {"execution":{"iopub.status.busy":"2026-10-17T12:57:29.133389Z","iopub.execute_input":"2026-10-17T12:57:29.133819Z","iopub.status.idle":"2026-10-17T12:57:29.166477Z","shell.execute_reply.started":"2026-10-17T12:57:29.133783Z","shell.execute_reply":"2026-10-17T12:57:29.165714Z"},"jupyter":{"outputs_hidden":false}}
 # CELL 7: Training and Validation Loops
 # Uses Automatic Mixed Precision (AMP) for:
 #   - 2x faster training on modern GPUs
@@ -544,12 +547,108 @@ def train_epoch(model, loader, optimizer, criterion, scaler):
     
     return epoch_loss / len(loader)
 
+
+def create_fixed_split(coco, img_ids, path, val_fraction=0.2):
+    """Create or reload a seeded split stratified by instance count and foreground area."""
+    if os.path.exists(path):
+        with open(path) as f:
+            split = json.load(f)
+        if set(split['train_ids'] + split['val_ids']) == set(img_ids):
+            return split['train_ids'], split['val_ids']
+
+    counts = np.array([len(coco.imgToAnns.get(img_id, [])) for img_id in img_ids])
+    areas = np.array([
+        sum(ann.get('area', 0) for ann in coco.imgToAnns.get(img_id, [])) /
+        (coco.imgs[img_id]['height'] * coco.imgs[img_id]['width'])
+        for img_id in img_ids
+    ])
+
+    def bins(values):
+        edges = np.unique(np.quantile(values, [0.25, 0.5, 0.75]))
+        return np.digitize(values, edges, right=True)
+
+    rng = random.Random(Config.SEED)
+    strata = {}
+    for img_id, count_bin, area_bin in zip(img_ids, bins(counts), bins(areas)):
+        strata.setdefault((int(count_bin), int(area_bin)), []).append(img_id)
+
+    val_ids = []
+    train_ids = []
+    for group in strata.values():
+        rng.shuffle(group)
+        n_val = round(len(group) * val_fraction)
+        val_ids.extend(group[:n_val])
+        train_ids.extend(group[n_val:])
+
+    target = round(len(img_ids) * val_fraction)
+    rng.shuffle(train_ids)
+    rng.shuffle(val_ids)
+    while len(val_ids) < target:
+        val_ids.append(train_ids.pop())
+    while len(val_ids) > target:
+        train_ids.append(val_ids.pop())
+    rng.shuffle(train_ids)
+    rng.shuffle(val_ids)
+
+    with open(path, 'w') as f:
+        json.dump({'seed': Config.SEED, 'train_ids': train_ids, 'val_ids': val_ids}, f, indent=2)
+    return train_ids, val_ids
+
+
+def panoptic_stats(pred_mask, annotations, coco):
+    """Standard one-class PQ matching plus split/merge diagnostics for one image."""
+    num_labels, labels = cv2.connectedComponents(pred_mask.astype(np.uint8))
+    pred_areas = np.bincount(labels.ravel(), minlength=num_labels)
+    pred_ids = np.flatnonzero(pred_areas >= Config.MIN_AREA)
+    pred_ids = pred_ids[pred_ids != 0]
+    pred_index = {label: i for i, label in enumerate(pred_ids)}
+    ious = np.zeros((len(annotations), len(pred_ids)), dtype=np.float32)
+
+    for gt_idx, ann in enumerate(annotations):
+        gt = coco.annToMask(ann).astype(bool)
+        intersections = np.bincount(labels[gt], minlength=num_labels)
+        gt_area = gt.sum()
+        for label, pred_idx in pred_index.items():
+            intersection = intersections[label]
+            union = gt_area + pred_areas[label] - intersection
+            ious[gt_idx, pred_idx] = intersection / union if union else 0.0
+
+    candidates = np.argwhere(ious > Config.PQ_IOU_THRESHOLD)
+    candidates = sorted(candidates, key=lambda pair: ious[tuple(pair)], reverse=True)
+    matched_gt, matched_pred, iou_sum = set(), set(), 0.0
+    for gt_idx, pred_idx in candidates:
+        if gt_idx not in matched_gt and pred_idx not in matched_pred:
+            matched_gt.add(int(gt_idx))
+            matched_pred.add(int(pred_idx))
+            iou_sum += float(ious[gt_idx, pred_idx])
+
+    diagnostic = ious > Config.DIAGNOSTIC_IOU_THRESHOLD
+    return {
+        'iou_sum': iou_sum,
+        'tp': len(matched_gt),
+        'fp': len(pred_ids) - len(matched_pred),
+        'fn': len(annotations) - len(matched_gt),
+        'splits': int((diagnostic.sum(axis=1) > 1).sum()) if len(annotations) else 0,
+        'merges': int((diagnostic.sum(axis=0) > 1).sum()) if len(pred_ids) else 0,
+    }
+
+
+def finalize_panoptic(stats):
+    denominator = stats['tp'] + 0.5 * stats['fp'] + 0.5 * stats['fn']
+    return {
+        **stats,
+        'pq': stats['iou_sum'] / denominator if denominator else 1.0,
+        'sq': stats['iou_sum'] / stats['tp'] if stats['tp'] else 0.0,
+        'rq': stats['tp'] / denominator if denominator else 1.0,
+    }
+
 def validate(model, loader, criterion):
-    """Return average loss and mean per-image foreground Dice (not competition PQ)."""
+    """Return loss, foreground Dice, and one-class instance PQ diagnostics."""
     model.eval()
     epoch_loss = 0
     dice_sum = 0.0
     image_count = 0
+    pq_totals = dict(iou_sum=0.0, tp=0, fp=0, fn=0, splits=0, merges=0)
     
     with torch.no_grad():
         for images, masks in tqdm(loader, desc="Validating"):
@@ -566,9 +665,21 @@ def validate(model, loader, criterion):
             dice = (2 * (preds * masks).sum(dims) + 1e-6) / (
                 preds.sum(dims) + masks.sum(dims) + 1e-6)
             dice_sum += dice.sum().item()
+            batch_ids = loader.dataset.img_ids[image_count:image_count + images.size(0)]
+            for pred, img_id in zip(preds.cpu().numpy(), batch_ids):
+                pred_2048 = cv2.resize(
+                    pred.squeeze().astype(np.uint8),
+                    (Config.ORIGINAL_SIZE, Config.ORIGINAL_SIZE),
+                    interpolation=cv2.INTER_NEAREST)
+                stats = panoptic_stats(
+                    pred_2048, loader.dataset.coco.imgToAnns.get(img_id, []), loader.dataset.coco)
+                for key in pq_totals:
+                    pq_totals[key] += stats[key]
             image_count += images.size(0)
     
-    return epoch_loss / len(loader), dice_sum / image_count
+    metrics = finalize_panoptic(pq_totals)
+    metrics['foreground_dice'] = dice_sum / image_count
+    return epoch_loss / len(loader), metrics
 
 
 def fit_model(train_loader, val_loader, lr, weight_decay, epochs, trial=None):
@@ -580,7 +691,7 @@ def fit_model(train_loader, val_loader, lr, weight_decay, epochs, trial=None):
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     criterion = DiceBCELoss()
     scaler = GradScaler(enabled=Config.DEVICE == 'cuda')
-    best_dice = -1.0
+    best_pq = -1.0
     history = []
     print(f'Parameters: {sum(p.numel() for p in model.parameters()):,}; '
           f'size: {Config.IMG_SIZE}; batch: {Config.BATCH_SIZE}; lr: {lr:.2g}; wd: {weight_decay:.2g}')
@@ -590,33 +701,37 @@ def fit_model(train_loader, val_loader, lr, weight_decay, epochs, trial=None):
                 torch.cuda.reset_peak_memory_stats()
             started = time.perf_counter()
             train_loss = train_epoch(model, train_loader, optimizer, criterion, scaler)
-            val_loss, dice = validate(model, val_loader, criterion)
-            if not np.isfinite([train_loss, val_loss, dice]).all():
+            val_loss, metrics = validate(model, val_loader, criterion)
+            if not np.isfinite([train_loss, val_loss, metrics['pq']]).all():
                 raise RuntimeError('Non-finite training or validation result')
             peak_gib = torch.cuda.max_memory_allocated() / 2**30 if Config.DEVICE == 'cuda' else 0.0
             seconds = time.perf_counter() - started
             print(f'Epoch {epoch + 1}/{epochs}: train={train_loss:.4f}, val={val_loss:.4f}, '
-                  f'foreground Dice={dice:.4f}, {seconds:.1f}s, peak allocated={peak_gib:.2f} GiB')
+                  f"Dice={metrics['foreground_dice']:.4f}, PQ={metrics['pq']:.4f}, "
+                  f"SQ={metrics['sq']:.4f}, RQ={metrics['rq']:.4f}, "
+                  f"TP/FP/FN={metrics['tp']}/{metrics['fp']}/{metrics['fn']}, "
+                  f"splits/merges={metrics['splits']}/{metrics['merges']}, "
+                  f'{seconds:.1f}s, peak allocated={peak_gib:.2f} GiB')
             history.append(dict(epoch=epoch + 1, train_loss=train_loss, val_loss=val_loss,
-                                foreground_dice=dice, seconds=seconds, peak_allocated_gib=peak_gib))
-            if dice > best_dice:
-                best_dice = dice
+                                **metrics, seconds=seconds, peak_allocated_gib=peak_gib))
+            if metrics['pq'] > best_pq:
+                best_pq = metrics['pq']
                 if trial is None:
                     torch.save(model.state_dict(), os.path.join(Config.OUT_DIR, 'best_lightweight.pth'))
             if trial is not None:
-                trial.report(dice, epoch)
+                trial.report(metrics['pq'], epoch)
                 if trial.should_prune():
                     raise optuna.TrialPruned()
             else:
                 pd.DataFrame(history).to_csv(os.path.join(Config.OUT_DIR, 'lightweight_history.csv'), index=False)
-        return best_dice
+        return best_pq
     finally:
         del model, optimizer, scaler
         gc.collect()
         if Config.DEVICE == 'cuda':
             torch.cuda.empty_cache()
 
-# %% [code] {"execution":{"iopub.status.busy":"2026-10-17T10:17:42.489156Z","iopub.execute_input":"2026-10-17T10:17:42.489499Z","iopub.status.idle":"2026-10-17T10:17:42.510437Z","shell.execute_reply.started":"2026-10-17T10:17:42.489473Z","shell.execute_reply":"2026-10-17T10:17:42.509794Z"}}
+# %% [code] {"execution":{"iopub.status.busy":"2026-10-17T12:57:29.167496Z","iopub.execute_input":"2026-10-17T12:57:29.167894Z","iopub.status.idle":"2026-10-17T12:57:29.187788Z","shell.execute_reply.started":"2026-10-17T12:57:29.167865Z","shell.execute_reply":"2026-10-17T12:57:29.187195Z"},"jupyter":{"outputs_hidden":false}}
 # CELL 8: Inference and Kaggle Submission Generator
 # This cell:
 # 1. Runs the trained model on all test images
@@ -715,14 +830,14 @@ def generate_submission(model, test_paths, out_path):
     print(f"Total filaments detected: {len(df)}")
     print(f"Unique images: {df['filament_id'].str.rsplit('_', n=1).str[0].nunique()}")
 
-# %% [code] {"execution":{"iopub.status.busy":"2026-10-17T10:17:42.512338Z","iopub.execute_input":"2026-10-17T10:17:42.512631Z","iopub.status.idle":"2026-10-17T10:17:48.428416Z","shell.execute_reply.started":"2026-10-17T10:17:42.512613Z","shell.execute_reply":"2026-10-17T10:17:48.427243Z"}}
+# %% [code] {"execution":{"iopub.status.busy":"2026-10-17T12:57:29.188680Z","iopub.execute_input":"2026-10-17T12:57:29.188989Z","iopub.status.idle":"2026-10-17T13:20:48.986374Z","shell.execute_reply.started":"2026-10-17T12:57:29.188957Z","shell.execute_reply":"2026-10-17T13:20:48.985452Z"},"jupyter":{"outputs_hidden":false}}
 # CELL 9: Main Execution Pipeline
 # This cell orchestrates the entire workflow:
 # 1. Load COCO annotations JSON
 # 2. Split images into train (80%) and validation (20%)
 # 3. Create DataLoaders with augmentations
 # 4. Initialize Mag-Agent U²-Net model
-# 5. Run short Optuna trials, then train the winner and save its best Dice checkpoint
+# 5. Run short Optuna trials, then train the winner and save its best PQ checkpoint
 # 6. Load best model and generate Kaggle submission
 
 # CELL 9: Main Execution Pipeline (FIXED FOR STRING IDs)
@@ -751,15 +866,15 @@ def main():
     print(f"Total annotations: {len(coco.dataset.get('annotations', []))}")
     print("=" * 60)
     
-    # === 2. Train/Val Split (80/20) ===
-    split_idx = int(0.8 * len(valid_img_ids))
-    if not 0 < split_idx < len(valid_img_ids):
+    # === 2. Fixed, seeded, stratified Train/Val Split (80/20) ===
+    if len(valid_img_ids) < 2:
         raise ValueError('Need at least two readable training images for train/validation split')
-    train_ids = valid_img_ids[:split_idx]
-    val_ids = valid_img_ids[split_idx:]
+    split_path = os.path.join(Config.OUT_DIR, 'split_seed_42.json')
+    train_ids, val_ids = create_fixed_split(coco, valid_img_ids, split_path)
     
     print(f"Training images: {len(train_ids)}")
     print(f"Validation images: {len(val_ids)}")
+    print(f"Fixed split: {split_path}")
     
     # === 3. Create Datasets and DataLoaders ===
     train_ds = SolarDataset(coco, train_ids, Config.TRAIN_DIR, Config.IMG_SIZE, train_transforms)
@@ -788,7 +903,7 @@ def main():
 
     study.optimize(objective, n_trials=Config.N_TRIALS, n_jobs=1, gc_after_trial=True)
     study.trials_dataframe().to_csv(os.path.join(Config.OUT_DIR, 'optuna_trials.csv'), index=False)
-    print(f'Best short-trial foreground Dice: {study.best_value:.4f}; {study.best_params}')
+    print(f'Best short-trial PQ: {study.best_value:.4f}; {study.best_params}')
 
     # === 5. Fresh, longer training with the selected optimizer settings ===
     fit_model(train_loader, val_loader, **study.best_params, epochs=Config.EPOCHS)
@@ -814,63 +929,121 @@ def main():
 # Run the pipeline
 main()
 
-# %% [code] {"execution":{"iopub.status.busy":"2026-10-17T10:17:48.429154Z","iopub.status.idle":"2026-10-17T10:17:48.429410Z","shell.execute_reply.started":"2026-10-17T10:17:48.429294Z","shell.execute_reply":"2026-10-17T10:17:48.429307Z"}}
-# CELL 10: Optional - Visualize Sample Predictions
-# This cell shows a few example predictions overlaid on the original images
-# so you can visually verify the model quality before submitting.
+# %% [code] {"jupyter":{"outputs_hidden":false}}
+
+
+# %% [code] {"execution":{"iopub.status.busy":"2026-10-17T13:20:48.987833Z","iopub.execute_input":"2026-10-17T13:20:48.988249Z","iopub.status.idle":"2026-10-17T13:21:02.648067Z","shell.execute_reply.started":"2026-10-17T13:20:48.988223Z","shell.execute_reply":"2026-10-17T13:21:02.647340Z"},"jupyter":{"outputs_hidden":false}}
+# CELL 10: Visualize Sample Predictions
 
 def visualize_predictions(model, coco, img_ids, img_dir, num_samples=4):
-    """Display sample predictions for visual verification."""
+    """Display original images, ground-truth masks, and predictions."""
     model.eval()
     fig, axes = plt.subplots(num_samples, 3, figsize=(18, 6 * num_samples))
-    
+
     if num_samples == 1:
         axes = axes[np.newaxis, :]
-    
+
     with torch.no_grad():
         for i, img_id in enumerate(img_ids[:num_samples]):
             img_info = coco.imgs[img_id]
             img_path = os.path.join(img_dir, img_info['file_name'])
-            
-            # Load and preprocess
+
             img = load_image(img_path)
+            if img is None:
+                raise FileNotFoundError(f"Cannot read image: {img_path}")
+
             img = (img - img.min()) / (img.max() - img.min() + 1e-8)
             img_limb, _ = remove_limb_darkening(img)
             mag_map = get_magnetic_proxy(img_limb)
-            
-            img_3ch = np.stack([img_limb, img_limb, mag_map], axis=-1).astype(np.float32)
-            img_1024 = cv2.resize(img_3ch, (Config.IMG_SIZE, Config.IMG_SIZE))
-            tensor = torch.tensor(img_1024).permute(2, 0, 1).unsqueeze(0).to(Config.DEVICE)
-            
+
+            img_3ch = np.stack(
+                [img_limb, img_limb, mag_map],
+                axis=-1
+            ).astype(np.float32)
+
+            resized_img = cv2.resize(
+                img_3ch,
+                (Config.IMG_SIZE, Config.IMG_SIZE)
+            )
+
+            tensor = (
+                torch.from_numpy(resized_img)
+                .permute(2, 0, 1)
+                .unsqueeze(0)
+                .to(Config.DEVICE)
+            )
+
             with autocast():
                 logits = model(tensor)
-            
-            pred = (torch.sigmoid(logits) > Config.THRESHOLD).cpu().numpy().squeeze()
-            
-            # Get ground truth mask
-            anns = coco.imgToAnns.get(img_id, [])
-            gt_mask = np.zeros((Config.IMG_SIZE, Config.IMG_SIZE), dtype=np.float32)
-            for ann in anns:
-                m = coco.annToMask(ann)
-                m = cv2.resize(m, (Config.IMG_SIZE, Config.IMG_SIZE))
-                gt_mask = np.maximum(gt_mask, m)
-            
-            # Plot
+
+            prediction = (
+                torch.sigmoid(logits.float()) > Config.THRESHOLD
+            ).cpu().numpy().squeeze()
+
+            annotations = coco.imgToAnns.get(img_id, [])
+            ground_truth = np.zeros(
+                (Config.IMG_SIZE, Config.IMG_SIZE),
+                dtype=np.float32
+            )
+
+            for annotation in annotations:
+                mask = coco.annToMask(annotation)
+                mask = cv2.resize(
+                    mask,
+                    (Config.IMG_SIZE, Config.IMG_SIZE),
+                    interpolation=cv2.INTER_NEAREST
+                )
+                ground_truth = np.maximum(ground_truth, mask)
+
             axes[i, 0].imshow(img_limb, cmap='gray')
             axes[i, 0].set_title(f'Original: {img_info["file_name"]}')
             axes[i, 0].axis('off')
-            
-            axes[i, 1].imshow(gt_mask, cmap='gray')
+
+            axes[i, 1].imshow(ground_truth, cmap='gray')
             axes[i, 1].set_title('Ground Truth')
             axes[i, 1].axis('off')
-            
-            axes[i, 2].imshow(pred, cmap='gray')
+
+            axes[i, 2].imshow(prediction, cmap='gray')
             axes[i, 2].set_title('Prediction')
             axes[i, 2].axis('off')
-    
+
     plt.tight_layout()
-    plt.savefig(os.path.join(Config.OUT_DIR, 'predictions.png'), dpi=150)
+
+    output_path = os.path.join(Config.OUT_DIR, 'predictions.png')
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.show()
+
+    print(f'Visualization saved to: {output_path}')
+
+
+model = MagAgentU2Net(
+    in_ch=Config.IN_CHANNELS,
+    out_ch=Config.OUT_CHANNELS
+).to(Config.DEVICE)
+
+checkpoint_path = os.path.join(
+    Config.OUT_DIR,
+    'best_lightweight.pth'
+)
+
+model.load_state_dict(
+    torch.load(
+        checkpoint_path,
+        map_location=Config.DEVICE,
+        weights_only=True
+    )
+)
+
+coco = COCO(Config.ANNOTATIONS_FILE)
+sample_ids = list(coco.imgs.keys())[:4]
+
+visualize_predictions(
+    model=model,
+    coco=coco,
+    img_ids=sample_ids,
+    img_dir=Config.TRAIN_DIR,
+    num_samples=4
+)
 
 # Run visualization (uses the trained model)
 # Uncomment after training is complete:

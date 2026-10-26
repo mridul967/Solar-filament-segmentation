@@ -8,16 +8,13 @@
 !pip install optuna albumentations pycocotools timm transformers -q
 
 import os
-# Must be set before importing torch. This reduces allocator fragmentation for
-# the large, temporary feature maps produced by 1024x1024 RSU blocks.
-os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
-
 import glob
 import random
 from collections import defaultdict
 import numpy as np
 import pandas as pd
 import cv2
+cv2.setNumThreads(1)
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import warnings
@@ -78,10 +75,10 @@ class Config:
     # the effective batch size remains 4 without changing the architecture.
     BATCH_SIZE = 2
     ACCUM_STEPS = 2
-    EPOCHS = 18           # Total training epochs (converges with pretrained SAM 2 Hiera + cosine schedule)
+    EPOCHS = 25           # Total training epochs (converges with pretrained SAM 2 Hiera + cosine schedule)
     LR = 2e-4             # Learning rate (Adam optimizer)
     WEIGHT_DECAY = 1e-4   # L2 regularization
-    NUM_WORKERS = 4       # DataLoader workers (4 workers keep both T4 GPUs fed without CPU stalls)
+    NUM_WORKERS = 2       # DataLoader workers (4 workers keep both T4 GPUs fed without CPU stalls)
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
     
     # === MODEL PARAMETERS ===
@@ -151,6 +148,8 @@ def load_image(path):
         img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
     return img
 
+_DISK_MASK_CACHE = {}
+
 def remove_limb_darkening(img):
     """
     Removes limb darkening by creating a circular mask around the solar disk
@@ -164,23 +163,22 @@ def remove_limb_darkening(img):
         mask: Binary mask of the solar disk
     """
     h, w = img.shape
-    Y, X = np.ogrid[:h, :w]
-    cy, cx = h // 2, w // 2
+    mask = _DISK_MASK_CACHE.get((h, w))
+    if mask is None:
+        Y, X = np.ogrid[:h, :w]
+        cy, cx = h // 2, w // 2
+        r = np.sqrt((X - cx)**2 + (Y - cy)**2)
+        max_r = np.min([cx, cy]) * 0.98  # 98% of radius to cleanly cut the limb
+        mask = r < max_r
+        _DISK_MASK_CACHE[(h, w)] = mask
     
-    # Distance from center of solar disk
-    r = np.sqrt((X - cx)**2 + (Y - cy)**2)
-    max_r = np.min([cx, cy]) * 0.98  # 98% of radius to cleanly cut the limb
+    # Normalize within the mask in float32 (avoids float64 promotion)
+    img_f = img.astype(np.float32, copy=False)
+    valid_pixels = img_f[mask]
+    img_min = np.float32(np.min(valid_pixels))
+    img_max = np.float32(np.max(valid_pixels))
     
-    # Create circular mask
-    mask = r < max_r
-    
-    # Normalize within the mask
-    img_masked = img * mask
-    valid_pixels = img_masked[mask]
-    img_min = np.min(valid_pixels)
-    img_max = np.max(valid_pixels)
-    
-    img_norm = (img_masked - img_min) / (img_max - img_min + 1e-8)
+    img_norm = (img_f - img_min) / (img_max - img_min + np.float32(1e-8))
     img_norm[~mask] = 0.0
     return img_norm, mask
 
@@ -233,12 +231,13 @@ def get_filament_valley_map(img_limb, disk_mask):
 
 def prepare_input_3ch(img):
     """Unified 3-channel preprocessing for train, val, and test inference."""
-    img = (img - img.min()) / (img.max() - img.min() + 1e-8)
-    img_limb, disk_mask = remove_limb_darkening(img)
+    img_f = img.astype(np.float32, copy=False)
+    img_f = (img_f - np.float32(img_f.min())) / (np.float32(img_f.max() - img_f.min()) + np.float32(1e-8))
+    img_limb, disk_mask = remove_limb_darkening(img_f)
     valley_map = get_filament_valley_map(img_limb, disk_mask)
     mag_map = get_magnetic_proxy(img_limb)
     mag_map[~disk_mask] = 0.0
-    return np.stack([img_limb, valley_map, mag_map], axis=-1).astype(np.float32), img_limb
+    return np.stack([img_limb, valley_map, mag_map], axis=-1).astype(np.float32, copy=False), img_limb
 
 def extract_morphological_centerline(mask_bin):
     """
@@ -302,7 +301,7 @@ class SolarDataset(Dataset):
     def __len__(self):
         return len(self.img_ids)
 
-    def _sample_native_crop_coords(self, mask_2048):
+    def _sample_native_crop_coords(self, mask_2048, anns=None):
         """
         Samples top-left (y0, x0) for a native-scale 1024x1024 crop from a 2048x2048 image:
         - 70% centered on filament foreground pixels with random spatial jitter
@@ -315,15 +314,29 @@ class SolarDataset(Dataset):
         if max_y == 0 and max_x == 0:
             return 0, 0
 
-        fg_coords = np.argwhere(mask_2048 > 0.5)
-        if len(fg_coords) > 0 and random.random() < Config.FILAMENT_CENTER_PROB:
-            yc, xc = fg_coords[random.randrange(len(fg_coords))]
-            jitter = getattr(Config, 'CROP_JITTER', 256)
-            dy = random.randint(-jitter, jitter)
-            dx = random.randint(-jitter, jitter)
-            y0 = int(np.clip(yc - crop_sz // 2 + dy, 0, max_y))
-            x0 = int(np.clip(xc - crop_sz // 2 + dx, 0, max_x))
-            return y0, x0
+        if random.random() < Config.FILAMENT_CENTER_PROB:
+            yc, xc = None, None
+            # Fast O(1) foreground point sampling from annotation spine/polygon/bbox before scanning 4.2M pixels
+            if anns:
+                ann = anns[random.randrange(len(anns))]
+                raw_spine = ann.get('spine')
+                if isinstance(raw_spine, list) and len(raw_spine) >= 2:
+                    idx_pt = random.randrange(len(raw_spine) // 2) * 2
+                    xc, yc = int(raw_spine[idx_pt]), int(raw_spine[idx_pt + 1])
+                elif isinstance(ann.get('bbox'), list) and len(ann['bbox']) == 4:
+                    bx, by, bw, bh = ann['bbox']
+                    xc, yc = int(bx + bw * 0.5), int(by + bh * 0.5)
+            if yc is None or xc is None:
+                fg_coords = np.argwhere(mask_2048 > 0)
+                if len(fg_coords) > 0:
+                    yc, xc = fg_coords[random.randrange(len(fg_coords))]
+            if yc is not None and xc is not None:
+                jitter = getattr(Config, 'CROP_JITTER', 256)
+                dy = random.randint(-jitter, jitter)
+                dx = random.randint(-jitter, jitter)
+                y0 = int(np.clip(yc - crop_sz // 2 + dy, 0, max_y))
+                x0 = int(np.clip(xc - crop_sz // 2 + dx, 0, max_x))
+                return y0, x0
 
         # 30% random solar disk / limb background crop
         cy, cx = h // 2, w // 2
@@ -349,30 +362,46 @@ class SolarDataset(Dataset):
         if img is None:
             img = np.random.randint(0, 65535, (2048, 2048), dtype=np.uint16)
         
-        # Stack into 3 channels at native 2048x2048: [H-alpha, Filament Valley Map, Magnetic Map]
-        img_3ch_2048, _ = prepare_input_3ch(img)
-        
         # FIX 2: Direct dictionary access for annotations
         # coco.imgToAnns maps image_id directly to a list of annotation dicts
         anns = self.coco.imgToAnns.get(img_id, [])
         
-        # Create combined binary mask at original 2048x2048 resolution
-        mask_2048 = np.zeros((2048, 2048), dtype=np.float32)
+        # Create combined binary mask at original 2048x2048 resolution in uint8 (4x less memory bandwidth)
+        mask_u8 = np.zeros((2048, 2048), dtype=np.uint8)
         for ann in anns:
             # annToMask handles the polygon_list format perfectly
-            m = self.coco.annToMask(ann)
-            mask_2048 = np.maximum(mask_2048, m)
+            mask_u8 = np.maximum(mask_u8, self.coco.annToMask(ann))
+        mask_2048 = mask_u8.astype(np.float32)
         
         # Precompute 1px-dilated morphological centerline on CPU at 2048x2048
         spine_2048 = rasterize_dilated_spine(anns, mask_2048, img_size=None)
         
         # Multi-Scale Sampling: 50% full-disk 1024x1024 views, 50% native 1024x1024 crops
+        # Lossless 32px halo crop (> 15px Gaussian radius) avoids blurring unused 75% of 2048x2048 image
         if self.training and random.random() < Config.CROP_PROB:
-            y0, x0 = self._sample_native_crop_coords(mask_2048)
-            img_3ch = img_3ch_2048[y0:y0 + self.img_size, x0:x0 + self.img_size].copy()
+            y0, x0 = self._sample_native_crop_coords(mask_u8, anns=anns)
+            img_f = img.astype(np.float32, copy=False)
+            img_f = (img_f - np.float32(img_f.min())) / (np.float32(img_f.max() - img_f.min()) + np.float32(1e-8))
+            img_limb, disk_mask = remove_limb_darkening(img_f)
+            pad = 32
+            h, w = img_limb.shape
+            yp0, xp0 = max(0, y0 - pad), max(0, x0 - pad)
+            yp1, xp1 = min(h, y0 + self.img_size + pad), min(w, x0 + self.img_size + pad)
+            limb_patch = img_limb[yp0:yp1, xp0:xp1]
+            disk_patch = disk_mask[yp0:yp1, xp0:xp1]
+            valley_patch = get_filament_valley_map(limb_patch, disk_patch)
+            mag_patch = get_magnetic_proxy(limb_patch)
+            mag_patch[~disk_patch] = 0.0
+            dy, dx = y0 - yp0, x0 - xp0
+            img_3ch = np.stack([
+                limb_patch[dy:dy + self.img_size, dx:dx + self.img_size],
+                valley_patch[dy:dy + self.img_size, dx:dx + self.img_size],
+                mag_patch[dy:dy + self.img_size, dx:dx + self.img_size],
+            ], axis=-1).astype(np.float32, copy=False)
             mask = (mask_2048[y0:y0 + self.img_size, x0:x0 + self.img_size] > 0.5).astype(np.float32)
             spine = (spine_2048[y0:y0 + self.img_size, x0:x0 + self.img_size] > 0.15).astype(np.float32)
         else:
+            img_3ch_2048, _ = prepare_input_3ch(img)
             img_3ch = cv2.resize(img_3ch_2048, (self.img_size, self.img_size))
             mask = cv2.resize(mask_2048, (self.img_size, self.img_size))
             mask = (mask > 0.5).astype(np.float32)
@@ -563,14 +592,14 @@ class HieraWindowStage(nn.Module):
         nh, nw = Hp // ws, Wp // ws
 
         # Partition into non-overlapping [B * nh * nw, ws * ws, C] windows
-        win = x_pad.view(B, C, nh, ws, nw, ws).permute(0, 2, 4, 3, 5, 1).reshape(B * nh * nw, ws * ws, C)
-        win_norm = self.norm1(win)
+        win = x_pad.view(B, C, nh, ws, nw, ws).permute(0, 2, 4, 3, 5, 1).contiguous().reshape(B * nh * nw, ws * ws, C)
+        win_norm = self.norm1(win).contiguous()
         attn_out, _ = self.attn(win_norm, win_norm, win_norm, need_weights=False)
         win = win + attn_out
         win = win + self.mlp(self.norm2(win))
 
         # Unpartition back to [B, C, H, W] + local depthwise positional residual
-        out = win.view(B, nh, nw, ws, ws, C).permute(0, 5, 1, 3, 2, 4).reshape(B, C, Hp, Wp)
+        out = win.view(B, nh, nw, ws, ws, C).permute(0, 5, 1, 3, 2, 4).contiguous().reshape(B, C, Hp, Wp)
         if pad_h or pad_w:
             out = out[:, :, :H, :W]
         return out + self.dw_conv(out)
@@ -743,75 +772,79 @@ class VLMSemanticBridge(nn.Module):
             If e3 is provided: (e3_mod, b_mod, vlm_logits, gamma, beta)
             If e3 is None:     (b_mod, vlm_logits, gamma, beta)
         """
-        B, _, Hb, Wb = b.shape
-        H4, W4 = Hb * 2, Wb * 2
+        with torch.amp.autocast('cuda', enabled=False):
+            b = b.float()
+            x = x.float() if x is not None else None
+            e3 = e3.float() if e3 is not None else None
+            B, _, Hb, Wb = b.shape
+            H4, W4 = Hb * 2, Wb * 2
 
-        # Extract multi-scale Hiera stages [C1, C2, C3, C4] at strides [4, 8, 16, 32]
-        if x is not None:
-            c1 = self.stage1(x)
-        elif e3 is not None:
-            c1 = self.stage1.dw_conv(self.e3_to_c1(e3))
-        else:
-            b_up = F.interpolate(b, size=(H4, W4), mode='bilinear', align_corners=False)
-            c1 = self.stage1.dw_conv(self.b_to_c2(b_up)[:, :self.stage_channels[0]])
+            # Extract multi-scale Hiera stages [C1, C2, C3, C4] at strides [4, 8, 16, 32]
+            if x is not None:
+                c1 = self.stage1(x)
+            elif e3 is not None:
+                c1 = self.stage1.dw_conv(self.e3_to_c1(e3))
+            else:
+                b_up = F.interpolate(b, size=(H4, W4), mode='bilinear', align_corners=False)
+                c1 = self.stage1.dw_conv(self.b_to_c2(b_up)[:, :self.stage_channels[0]])
 
-        if e3 is not None:
-            if c1.shape[2:] != e3.shape[2:]:
-                c1 = F.interpolate(c1, size=e3.shape[2:], mode='bilinear', align_corners=False)
-            c1 = c1 + self.e3_to_c1(e3)
+            if e3 is not None:
+                if c1.shape[2:] != e3.shape[2:]:
+                    c1 = F.interpolate(c1, size=e3.shape[2:], mode='bilinear', align_corners=False)
+                c1 = c1 + self.e3_to_c1(e3)
 
-        c2 = self.stage2(c1)
-        if c2.shape[2:] != (Hb, Wb):
-            c2 = F.interpolate(c2, size=(Hb, Wb), mode='bilinear', align_corners=False)
-        c2 = c2 + self.b_to_c2(b)
-        c3 = self.stage3(c2)
-        c4 = self.stage4(c3)
+            c2 = self.stage2(c1)
+            if c2.shape[2:] != (Hb, Wb):
+                c2 = F.interpolate(c2, size=(Hb, Wb), mode='bilinear', align_corners=False)
+            c2 = c2 + self.b_to_c2(b)
+            c3 = self.stage3(c2)
+            c4 = self.stage4(c3)
 
-        # Top-down FPN fusion across [C1, C2, C3, C4]
-        p4 = self.lat4(c4)
-        p3 = self.lat3(c3) + F.interpolate(p4, size=c3.shape[2:], mode='bilinear', align_corners=False)
-        p2 = self.fpn_smooth2(
-            self.lat2(c2) + F.interpolate(p3, size=c2.shape[2:], mode='bilinear', align_corners=False)
-        )
-        p1 = self.fpn_smooth1(
-            self.lat1(c1) + F.interpolate(p2, size=c1.shape[2:], mode='bilinear', align_corners=False)
-        )
+            # Top-down FPN fusion across [C1, C2, C3, C4]
+            p4 = self.lat4(c4)
+            p3 = self.lat3(c3) + F.interpolate(p4, size=c3.shape[2:], mode='bilinear', align_corners=False)
+            p2 = self.fpn_smooth2(
+                self.lat2(c2) + F.interpolate(p3, size=c2.shape[2:], mode='bilinear', align_corners=False)
+            )
+            p1 = self.fpn_smooth1(
+                self.lat1(c1) + F.interpolate(p2, size=c1.shape[2:], mode='bilinear', align_corners=False)
+            )
 
-        # SAM 2 Mask-Query Token Decoder at stride-8 FPN feature map P2
-        fg_q = F.normalize(self.pos_anchors + self.fg_queries, dim=-1)  # [Q, D]
-        bg_q = F.normalize(self.neg_anchors + self.bg_queries, dim=-1)  # [Q, D]
-        all_queries = torch.cat([fg_q, bg_q], dim=0).unsqueeze(0).expand(B, -1, -1)  # [B, 2Q, D]
+            # SAM 2 Mask-Query Token Decoder at stride-8 FPN feature map P2
+            fg_q = F.normalize(self.pos_anchors + self.fg_queries, dim=-1)  # [Q, D]
+            bg_q = F.normalize(self.neg_anchors + self.bg_queries, dim=-1)  # [Q, D]
+            all_queries = torch.cat([fg_q, bg_q], dim=0).unsqueeze(0).expand(B, -1, -1).contiguous()  # [B, 2Q, D]
 
-        img_tokens = p2.flatten(2).transpose(1, 2)  # [B, Hb*Wb, D]
-        refined_q, _ = self.token_to_img_attn(all_queries, img_tokens, img_tokens, need_weights=False)
-        all_queries = all_queries + refined_q
-        attn_out, _ = self.img_to_token_attn(img_tokens, all_queries, all_queries, need_weights=False)
-        attn_map = p2 + attn_out.transpose(1, 2).reshape(B, self.fpn_dim, Hb, Wb)
+            img_tokens = p2.flatten(2).transpose(1, 2).contiguous()  # [B, Hb*Wb, D]
+            refined_q, _ = self.token_to_img_attn(all_queries, img_tokens, img_tokens, need_weights=False)
+            all_queries = (all_queries + refined_q).contiguous()
+            attn_out, _ = self.img_to_token_attn(img_tokens, all_queries, all_queries, need_weights=False)
+            attn_map = p2 + attn_out.transpose(1, 2).contiguous().reshape(B, self.fpn_dim, Hb, Wb)
 
-        # Mask-Query dot-product similarity maps (foreground filament spines vs background sunspots)
-        Q = fg_q.shape[0]
-        fg_refined = F.normalize(all_queries[:, :Q, :], dim=-1)
-        bg_refined = F.normalize(all_queries[:, Q:, :], dim=-1)
-        p2_norm = F.normalize(attn_map, dim=1)
-        scale = self.logit_scale.exp().clamp(1.0, 50.0)
+            # Mask-Query dot-product similarity maps (foreground filament spines vs background sunspots)
+            Q = fg_q.shape[0]
+            fg_refined = F.normalize(all_queries[:, :Q, :], dim=-1)
+            bg_refined = F.normalize(all_queries[:, Q:, :], dim=-1)
+            p2_norm = F.normalize(attn_map, dim=1)
+            scale = self.logit_scale.exp().clamp(1.0, 50.0)
 
-        sim_fg = torch.einsum("bdhw,bqd->bqhw", p2_norm, fg_refined).mean(dim=1, keepdim=True) * scale
-        sim_bg = torch.einsum("bdhw,bqd->bqhw", p2_norm, bg_refined).mean(dim=1, keepdim=True) * scale
-        vlm_logits = sim_fg - sim_bg
+            sim_fg = torch.einsum("bdhw,bqd->bqhw", p2_norm, fg_refined).mean(dim=1, keepdim=True) * scale
+            sim_bg = torch.einsum("bdhw,bqd->bqhw", p2_norm, bg_refined).mean(dim=1, keepdim=True) * scale
+            vlm_logits = sim_fg - sim_bg
 
-        # Modulate bottleneck b [B, 512, H/8, W/8] and high-res skip e3 [B, 256, H/4, W/4]
-        b_gate = self.b_out(torch.cat([attn_map, torch.sigmoid(sim_fg), torch.sigmoid(sim_bg)], dim=1))
-        b_mod = b * (1.0 + b_gate)
+            # Modulate bottleneck b [B, 512, H/8, W/8] and high-res skip e3 [B, 256, H/4, W/4]
+            b_gate = self.b_out(torch.cat([attn_map, torch.sigmoid(sim_fg), torch.sigmoid(sim_bg)], dim=1))
+            b_mod = b * (1.0 + b_gate)
 
-        # Global query context -> FiLM (gamma, beta) for full-res CognitiveRefiner
-        query_pool = all_queries.mean(dim=1)  # [B, D]
-        gamma_beta = self.film_head(query_pool).unsqueeze(-1).unsqueeze(-1)
-        gamma, beta = torch.chunk(gamma_beta, 2, dim=1)
+            # Global query context -> FiLM (gamma, beta) for full-res CognitiveRefiner
+            query_pool = all_queries.mean(dim=1)  # [B, D]
+            gamma_beta = self.film_head(query_pool).unsqueeze(-1).unsqueeze(-1)
+            gamma, beta = torch.chunk(gamma_beta, 2, dim=1)
 
-        if e3 is not None:
-            e3_mod = e3 * (1.0 + 0.5 * self.e3_gate(p1))
-            return e3_mod, b_mod, vlm_logits, gamma, beta
-        return b_mod, vlm_logits, gamma, beta
+            if e3 is not None:
+                e3_mod = e3 * (1.0 + 0.5 * self.e3_gate(p1))
+                return e3_mod, b_mod, vlm_logits, gamma, beta
+            return b_mod, vlm_logits, gamma, beta
 
 
 # --- 3. Agentic Cognitive Layer (Topology Refiner) ---
@@ -1122,7 +1155,7 @@ def forward_model(model, images, return_aux=False):
 def train_epoch(model, loader, optimizer, criterion, scaler, epoch=1):
     """Train for one epoch. Returns average loss."""
     model.train()
-    epoch_loss = 0
+    epoch_loss = torch.zeros(1, device=Config.DEVICE, dtype=torch.float32)
     
     optimizer.zero_grad(set_to_none=True)
     remainder = len(loader) % Config.ACCUM_STEPS
@@ -1162,14 +1195,15 @@ def train_epoch(model, loader, optimizer, criterion, scaler, epoch=1):
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
 
-        epoch_loss += loss.item() * accumulation_divisor
+        # Accumulate on GPU to avoid blocking host-device cudaStreamSynchronize every batch
+        epoch_loss += loss.detach().float() * accumulation_divisor
     
-    return epoch_loss / len(loader)
+    return (epoch_loss / len(loader)).item()
 
 def validate(model, loader, criterion, epoch=5):
     """Validate model. Returns average loss."""
     model.eval()
-    epoch_loss = 0
+    epoch_loss = torch.zeros(1, device=Config.DEVICE, dtype=torch.float32)
     
     with torch.no_grad():
         for batch in tqdm(loader, desc="Validating"):
@@ -1188,9 +1222,9 @@ def validate(model, loader, criterion, epoch=5):
                     logits, masks, spine_targets=spines, vlm_logits=vlm_logits, epoch=epoch
                 )
             
-            epoch_loss += loss.item()
+            epoch_loss += loss.detach().float()
     
-    return epoch_loss / len(loader)
+    return (epoch_loss / len(loader)).item()
 
 # %% [code] {"execution":{"iopub.status.busy":"2026-10-17T10:17:42.489156Z","iopub.execute_input":"2026-10-17T10:17:42.489499Z","iopub.status.idle":"2026-10-17T10:17:42.510437Z","shell.execute_reply.started":"2026-10-17T10:17:42.489473Z","shell.execute_reply":"2026-10-17T10:17:42.509794Z"}}
 # CELL 8: Inference and Kaggle Submission Generator
@@ -1396,6 +1430,15 @@ def seed_everything(seed=Config.SEED):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.benchmark = False
+        if hasattr(torch.backends.cuda, "enable_flash_sdp"):
+            torch.backends.cuda.enable_flash_sdp(False)
+        if hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
+            torch.backends.cuda.enable_mem_efficient_sdp(False)
+        if hasattr(torch.backends.cuda, "enable_cudnn_sdp"):
+            torch.backends.cuda.enable_cudnn_sdp(False)
+        if hasattr(torch.backends.cuda, "enable_math_sdp"):
+            torch.backends.cuda.enable_math_sdp(True)
 
 def save_v5_checkpoints(model, model_path, vlm_path):
     """Save segmentation weights to best_model.pth and VLM weights to best_vlm.pth."""
@@ -1468,12 +1511,10 @@ def main():
     train_loader = DataLoader(
         train_ds, batch_size=Config.BATCH_SIZE, shuffle=True, drop_last=True,
         num_workers=Config.NUM_WORKERS, pin_memory=True,
-        persistent_workers=Config.NUM_WORKERS > 0
     )
     val_loader = DataLoader(
         val_ds, batch_size=Config.BATCH_SIZE, shuffle=False, drop_last=False,
         num_workers=Config.NUM_WORKERS, pin_memory=True,
-        persistent_workers=Config.NUM_WORKERS > 0
     )
     
     # === 4. Initialize Model & Preload VLM Before Training ===
@@ -1488,11 +1529,13 @@ def main():
         torch.save(model.vlm_bridge.state_dict(), vlm_path)
         print(f"✓ Saved initial VLM weights to {vlm_path}")
 
+    model = model.to(Config.DEVICE)
     if torch.cuda.device_count() > 1:
         print(f"Using {torch.cuda.device_count()} GPUs with DataParallel")
         model = nn.DataParallel(model)
-    model = model.to(Config.DEVICE)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=Config.LR, weight_decay=Config.WEIGHT_DECAY)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=Config.LR, weight_decay=Config.WEIGHT_DECAY
+    )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=Config.EPOCHS, eta_min=1e-6)
     criterion = DiceBCELoss()
     scaler = torch.amp.GradScaler('cuda', enabled=Config.DEVICE == 'cuda')

@@ -34,10 +34,16 @@ from pycocotools.coco import COCO
 from pycocotools import mask as maskUtils
 
 try:
-    from transformers import CLIPTokenizer, CLIPTextModel
+    from transformers import AutoModel, CLIPTokenizer, CLIPTextModel
     HAS_TRANSFORMERS = True
 except Exception:
     HAS_TRANSFORMERS = False
+
+try:
+    import timm
+    HAS_TIMM = True
+except Exception:
+    HAS_TIMM = False
 
 print(f"PyTorch Version: {torch.__version__}")
 print(f"CUDA Available: {torch.cuda.is_available()}")
@@ -82,10 +88,33 @@ class Config:
     IN_CHANNELS = 3       # [Limb-corrected H-alpha, Filament Valley Map, Magnetic Proxy Map]
     OUT_CHANNELS = 1      # Single binary segmentation mask
     SEED = 42
-    VLM_MODEL_NAME = 'openai/clip-vit-base-patch32'
+    SAM2_VARIANT = 'tiny' # 'tiny' (facebook/sam2-hiera-tiny) or 'base_plus' (sam2_hiera_base_plus)
+    VLM_MODEL_NAME = (
+        'facebook/sam2-hiera-base-plus'
+        if SAM2_VARIANT == 'base_plus'
+        else 'facebook/sam2-hiera-tiny'
+    )
     MODEL_WEIGHTS_NAME = 'best_model.pth'
     VLM_WEIGHTS_NAME = 'best_vlm.pth'
-    SKEL_RECALL_WEIGHT = 0.25
+
+    # === MULTI-SCALE DATASET & TILING PARAMETERS ===
+    CROP_PROB = 0.50              # 50% full-disk 1024x1024 views, 50% native 1024x1024 crops from 2048x2048
+    FILAMENT_CENTER_PROB = 0.70   # Within native crops: 70% filament-centered (with jitter), 30% disk/limb bg
+    CROP_JITTER = 256             # Random spatial jitter around filament pixels in native crops
+    TILE_STRIDE = 512             # 3x3 sliding window of 1024x1024 native tiles (50% overlap)
+    GAUSSIAN_SIGMA = 256.0        # 2D Gaussian window sigma for seamless tile stitching
+    GLOBAL_GATE_THRESH = 0.05     # Anti-breakage soft gate threshold on P_global
+    LOCAL_BLEND_WEIGHT = 0.85     # High-resolution P_local weight
+    GLOBAL_BLEND_WEIGHT = 0.15    # Global full-disk P_global weight
+
+    # === TOPOLOGY-PRESERVING COMPOUND LOSS PARAMETERS ===
+    DICE_WEIGHT = 1.0
+    FOCAL_WEIGHT = 1.0
+    FOCAL_ALPHA = 0.50            # Neutral foreground/background polarity (configurable 0.50-0.65)
+    FOCAL_GAMMA = 2.0
+    LOVASZ_MAX_WEIGHT = 0.50      # Target LovaszHinge weight after linear warmup
+    LOVASZ_WARMUP_EPOCHS = 5      # Linearly warm up w_lovasz from 0.0 to 0.50 across epochs 1 to 5
+    SKEL_RECALL_WEIGHT = 0.25     # 1px-dilated morphological centerline recall weight
     VLM_PRIOR_WEIGHT = 0.15
     
     # === SUBMISSION PARAMETERS ===
@@ -211,23 +240,51 @@ def prepare_input_3ch(img):
     mag_map[~disk_mask] = 0.0
     return np.stack([img_limb, valley_map, mag_map], axis=-1).astype(np.float32), img_limb
 
-def rasterize_dilated_spine(anns, mask_2048, img_size=1024):
+def extract_morphological_centerline(mask_bin):
     """
-    Rasterizes annotated COCO spine polylines with thickness=3 at 2048x2048
-    before bilinear resizing to img_size so 1px spines never vanish under INTER_NEAREST.
-    Falls back to eroded mask centerlines when an annotation has no valid spine coordinates.
+    Fast CPU morphological skeletonization (Zhang-Suen / iterative opening-erosion)
+    that extracts a 1px centerline from a binary mask when explicit spine polylines are absent.
     """
-    spine_2048 = np.zeros((2048, 2048), dtype=np.float32)
+    skel = np.zeros_like(mask_bin, dtype=np.uint8)
+    work = (mask_bin > 0).astype(np.uint8)
+    if work.max() == 0:
+        return skel.astype(np.float32)
+    element = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+    for _ in range(32):
+        eroded = cv2.erode(work, element)
+        opened = cv2.dilate(eroded, element)
+        skel = cv2.bitwise_or(skel, cv2.subtract(work, opened))
+        work = eroded
+        if cv2.countNonZero(work) == 0:
+            break
+    if skel.max() == 0:
+        skel = (mask_bin > 0).astype(np.uint8)
+    return skel.astype(np.float32)
+
+def rasterize_dilated_spine(anns, mask_2048, img_size=None):
+    """
+    Precomputes 1px-dilated morphological centerline targets on CPU at 2048x2048.
+    Uses annotated COCO spine centerlines (1px + 1px dilation = 3x3 cross/box) or
+    morphological skeletonization fallback, then optionally resizes to img_size.
+    """
+    spine_1px = np.zeros(mask_2048.shape, dtype=np.uint8)
+    h, w = mask_2048.shape
     for ann in anns:
         raw_spine = np.asarray(ann.get('spine', []), dtype=np.float32)
         if raw_spine.ndim == 1 and len(raw_spine) >= 4 and len(raw_spine) % 2 == 0:
             pts = raw_spine.reshape(-1, 2)
-            if np.all((pts[:, 0] >= 0) & (pts[:, 0] < 2048) & (pts[:, 1] >= 0) & (pts[:, 1] < 2048)):
-                cv2.polylines(spine_2048, [np.rint(pts).astype(np.int32)], False, 1.0, thickness=3)
-    if spine_2048.max() == 0 and mask_2048.max() > 0:
-        spine_2048 = cv2.erode(mask_2048, np.ones((3, 3), np.uint8), iterations=1)
-    spine_resized = cv2.resize(spine_2048, (img_size, img_size), interpolation=cv2.INTER_LINEAR)
-    return (spine_resized > 0.2).astype(np.float32)
+            if np.all((pts[:, 0] >= 0) & (pts[:, 0] < w) & (pts[:, 1] >= 0) & (pts[:, 1] < h)):
+                cv2.polylines(spine_1px, [np.rint(pts).astype(np.int32)], False, 1, thickness=1)
+    if spine_1px.max() == 0 and mask_2048.max() > 0:
+        spine_1px = extract_morphological_centerline(mask_2048).astype(np.uint8)
+    # 1px dilation around the 1px centerline
+    dilate_kernel = np.ones((3, 3), dtype=np.uint8)
+    spine_dilated = cv2.dilate(spine_1px, dilate_kernel, iterations=1).astype(np.float32)
+    spine_dilated = np.minimum(spine_dilated, (mask_2048 > 0).astype(np.float32))
+    if img_size is not None and (img_size != h or img_size != w):
+        spine_resized = cv2.resize(spine_dilated, (img_size, img_size), interpolation=cv2.INTER_LINEAR)
+        return (spine_resized > 0.15).astype(np.float32)
+    return spine_dilated.astype(np.float32)
 
 # %% [code] {"execution":{"iopub.status.busy":"2026-10-17T10:17:42.408949Z","iopub.execute_input":"2026-10-17T10:17:42.409278Z","iopub.status.idle":"2026-10-17T10:17:42.431490Z","shell.execute_reply.started":"2026-10-17T10:17:42.409260Z","shell.execute_reply":"2026-10-17T10:17:42.430710Z"}}
 # CELL 4: PyTorch Dataset class (FIXED FOR STRING IDs)
@@ -236,16 +293,54 @@ def rasterize_dilated_spine(anns, mask_2048, img_size=1024):
 # This prevents the "isArrayLike" bug where strings are iterated character-by-character.
 
 class SolarDataset(Dataset):
-    def __init__(self, coco, img_ids, img_dir, img_size=1024, transforms=None, return_spine=False):
+    def __init__(
+        self, coco, img_ids, img_dir, img_size=1024, transforms=None,
+        return_spine=False, training=False
+    ):
         self.coco = coco
         self.img_ids = img_ids
         self.img_dir = img_dir
         self.img_size = img_size
         self.transforms = transforms
         self.return_spine = return_spine
+        self.training = training
 
     def __len__(self):
         return len(self.img_ids)
+
+    def _sample_native_crop_coords(self, mask_2048):
+        """
+        Samples top-left (y0, x0) for a native-scale 1024x1024 crop from a 2048x2048 image:
+        - 70% centered on filament foreground pixels with random spatial jitter
+        - 30% random solar disk / limb background to suppress sunspot & limb false positives
+        """
+        h, w = mask_2048.shape
+        crop_sz = self.img_size
+        max_y = max(0, h - crop_sz)
+        max_x = max(0, w - crop_sz)
+        if max_y == 0 and max_x == 0:
+            return 0, 0
+
+        fg_coords = np.argwhere(mask_2048 > 0.5)
+        if len(fg_coords) > 0 and random.random() < Config.FILAMENT_CENTER_PROB:
+            yc, xc = fg_coords[random.randrange(len(fg_coords))]
+            jitter = getattr(Config, 'CROP_JITTER', 256)
+            dy = random.randint(-jitter, jitter)
+            dx = random.randint(-jitter, jitter)
+            y0 = int(np.clip(yc - crop_sz // 2 + dy, 0, max_y))
+            x0 = int(np.clip(xc - crop_sz // 2 + dx, 0, max_x))
+            return y0, x0
+
+        # 30% random solar disk / limb background crop
+        cy, cx = h // 2, w // 2
+        radius = min(cx, cy) * 0.95
+        angle = random.uniform(0.0, 2.0 * np.pi)
+        dist = radius * np.sqrt(random.uniform(0.0, 1.0))
+        yc = int(cy + dist * np.sin(angle))
+        xc = int(cx + dist * np.cos(angle))
+        y0 = int(np.clip(yc - crop_sz // 2, 0, max_y))
+        x0 = int(np.clip(xc - crop_sz // 2, 0, max_x))
+        return y0, x0
 
     def __getitem__(self, idx):
         img_id = self.img_ids[idx]
@@ -260,9 +355,8 @@ class SolarDataset(Dataset):
         if img is None:
             img = np.random.randint(0, 65535, (2048, 2048), dtype=np.uint16)
         
-        # Stack into 3 channels: [H-alpha, Filament Valley Map, Magnetic Map]
-        img_3ch, _ = prepare_input_3ch(img)
-        img_3ch = cv2.resize(img_3ch, (self.img_size, self.img_size))
+        # Stack into 3 channels at native 2048x2048: [H-alpha, Filament Valley Map, Magnetic Map]
+        img_3ch_2048, _ = prepare_input_3ch(img)
         
         # FIX 2: Direct dictionary access for annotations
         # coco.imgToAnns maps image_id directly to a list of annotation dicts
@@ -275,10 +369,24 @@ class SolarDataset(Dataset):
             m = self.coco.annToMask(ann)
             mask_2048 = np.maximum(mask_2048, m)
         
-        # Resize mask to training size
-        mask = cv2.resize(mask_2048, (self.img_size, self.img_size))
-        mask = (mask > 0.5).astype(np.float32)
-        spine = rasterize_dilated_spine(anns, mask_2048, self.img_size)
+        # Precompute 1px-dilated morphological centerline on CPU at 2048x2048
+        spine_2048 = rasterize_dilated_spine(anns, mask_2048, img_size=None)
+        
+        # Multi-Scale Sampling: 50% full-disk 1024x1024 views, 50% native 1024x1024 crops
+        if self.training and random.random() < Config.CROP_PROB:
+            y0, x0 = self._sample_native_crop_coords(mask_2048)
+            img_3ch = img_3ch_2048[y0:y0 + self.img_size, x0:x0 + self.img_size].copy()
+            mask = (mask_2048[y0:y0 + self.img_size, x0:x0 + self.img_size] > 0.5).astype(np.float32)
+            spine = (spine_2048[y0:y0 + self.img_size, x0:x0 + self.img_size] > 0.15).astype(np.float32)
+        else:
+            img_3ch = cv2.resize(img_3ch_2048, (self.img_size, self.img_size))
+            mask = cv2.resize(mask_2048, (self.img_size, self.img_size))
+            mask = (mask > 0.5).astype(np.float32)
+            spine = cv2.resize(spine_2048, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR)
+            spine = (spine > 0.15).astype(np.float32)
+            # Re-dilate 1px on CPU if full-disk downsampling thinned any centerline segment
+            if spine.max() > 0:
+                spine = cv2.dilate(spine.astype(np.uint8), np.ones((3, 3), np.uint8), iterations=1).astype(np.float32)
         spine = np.maximum(spine * mask, 0.0).astype(np.float32)
         
         # Apply augmentations
@@ -418,114 +526,297 @@ class RSU(nn.Module):
         return d1 + x_in
 
 
-# --- 2.5 Vision-Language Semantic Bridge (CRIS / DenseCLIP / CLIPSeg + CoOp) ---
-# Aligns bottleneck visual features with domain-specific solar physics text prompts
-# ("filament channel with barbs along PIL" vs "isotropic sunspot / limb darkening").
-# Weights and preloaded CLIP text anchors are stored separately in `best_vlm.pth`.
-class VLMSemanticBridge(nn.Module):
-    POSITIVE_PROMPTS = (
-        "an H-alpha solar observation showing an elongated dark solar filament plasma channel",
-        "a thin sinuous solar filament spine with lateral barbs along a magnetic polarity inversion line",
-        "dark anisotropic thread-like chromospheric filament structure on the solar disk",
-        "continuous curved solar filament ribbon suspended above the solar photosphere",
-    )
-    NEGATIVE_PROMPTS = (
-        "a circular isotropic dark sunspot umbra and penumbra in a solar active region",
-        "background solar chromospheric granulation noise and bright plage regions",
-        "smooth radial solar limb darkening edge artifact near the solar horizon",
-        "uniform quiet sun photospheric background without filament channels",
-    )
-
-    def __init__(self, vis_ch=512, refiner_ch=64, embed_dim=512, proj_dim=128):
+# --- 2.5 SAM 2 Hiera Multi-Scale Bridge (self.vlm_bridge) ---
+# Implements the SAM 2 Hiera multi-scale backbone + FPN Neck + Mask-Query Token Decoder
+# ("SAM 2: Segment Anything in Images and Videos", Ravi et al., ICLR 2025;
+#  "Hiera: A Hierarchical Vision Transformer without the Bells-and-Whistles", Ryali et al., ICML 2023).
+# - Default: facebook/sam2-hiera-tiny (channels [96, 192, 384, 768] at strides [4, 8, 16, 32])
+# - Configurable: sam2_hiera_base_plus via Config.SAM2_VARIANT = 'base_plus' ([112, 224, 448, 896])
+# - Strict checkpoint isolation: saved exclusively to `best_vlm.pth` while MagAgentU2Net saves to `best_model.pth`.
+class HieraWindowStage(nn.Module):
+    """Hierarchical Vision Transformer (Hiera) stage with local windowed self-attention + FFN."""
+    def __init__(self, in_ch, out_ch, stride=1, window_size=8, num_heads=4):
         super().__init__()
-        # Deterministic orthogonal initialization for text anchors (overwritten when CLIP preloads)
-        gen = torch.Generator().manual_seed(42)
-        pos_init = F.normalize(torch.randn(len(self.POSITIVE_PROMPTS), embed_dim, generator=gen), dim=-1)
-        neg_init = F.normalize(torch.randn(len(self.NEGATIVE_PROMPTS), embed_dim, generator=gen), dim=-1)
-        self.register_buffer("pos_anchors", pos_init)
-        self.register_buffer("neg_anchors", neg_init)
-
-        # Learnable CoOp context adaptation tokens (Zhou et al., IJCV 2022)
-        self.pos_ctx = nn.Parameter(torch.zeros(len(self.POSITIVE_PROMPTS), embed_dim))
-        self.neg_ctx = nn.Parameter(torch.zeros(len(self.NEGATIVE_PROMPTS), embed_dim))
-
-        # Dense visual-text projection (DenseCLIP / CRIS)
-        self.txt_proj = nn.Linear(embed_dim, proj_dim, bias=False)
-        self.vis_proj = nn.Sequential(
-            nn.Conv2d(vis_ch, proj_dim, 1, bias=False),
-            nn.BatchNorm2d(proj_dim),
-            nn.GELU(),
+        self.proj = (
+            nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, kernel_size=stride, stride=stride, bias=False),
+                nn.BatchNorm2d(out_ch),
+                nn.GELU(),
+            )
+            if stride > 1 or in_ch != out_ch
+            else nn.Identity()
         )
-        self.cross_attn = nn.MultiheadAttention(proj_dim, num_heads=4, batch_first=True)
-        self.vis_out = nn.Sequential(
-            nn.Conv2d(proj_dim + 2, vis_ch, 1),
+        self.window_size = window_size
+        self.norm1 = nn.LayerNorm(out_ch)
+        self.attn = nn.MultiheadAttention(out_ch, num_heads=num_heads, batch_first=True)
+        self.norm2 = nn.LayerNorm(out_ch)
+        self.mlp = nn.Sequential(
+            nn.Linear(out_ch, out_ch * 2),
+            nn.GELU(),
+            nn.Linear(out_ch * 2, out_ch),
+        )
+        self.dw_conv = nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1, groups=out_ch, bias=False)
+
+    def forward(self, x):
+        x = self.proj(x)
+        B, C, H, W = x.shape
+        ws = min(self.window_size, H, W)
+        # Pad if H or W is not divisible by window_size
+        pad_h = (ws - H % ws) % ws
+        pad_w = (ws - W % ws) % ws
+        x_pad = F.pad(x, (0, pad_w, 0, pad_h)) if (pad_h or pad_w) else x
+        _, _, Hp, Wp = x_pad.shape
+        nh, nw = Hp // ws, Wp // ws
+
+        # Partition into non-overlapping [B * nh * nw, ws * ws, C] windows
+        win = x_pad.view(B, C, nh, ws, nw, ws).permute(0, 2, 4, 3, 5, 1).reshape(B * nh * nw, ws * ws, C)
+        win_norm = self.norm1(win)
+        attn_out, _ = self.attn(win_norm, win_norm, win_norm, need_weights=False)
+        win = win + attn_out
+        win = win + self.mlp(self.norm2(win))
+
+        # Unpartition back to [B, C, H, W] + local depthwise positional residual
+        out = win.view(B, nh, nw, ws, ws, C).permute(0, 5, 1, 3, 2, 4).reshape(B, C, Hp, Wp)
+        if pad_h or pad_w:
+            out = out[:, :, :H, :W]
+        return out + self.dw_conv(out)
+
+
+class VLMSemanticBridge(nn.Module):
+    SAM2_STAGE_CHANNELS = {
+        'tiny': (96, 192, 384, 768),
+        'sam2_hiera_tiny': (96, 192, 384, 768),
+        'facebook/sam2-hiera-tiny': (96, 192, 384, 768),
+        'base_plus': (112, 224, 448, 896),
+        'sam2_hiera_base_plus': (112, 224, 448, 896),
+        'facebook/sam2-hiera-base-plus': (112, 224, 448, 896),
+    }
+
+    def __init__(
+        self,
+        in_ch=3,
+        e3_ch=256,
+        vis_ch=512,
+        refiner_ch=64,
+        fpn_dim=256,
+        num_queries=4,
+        variant=None,
+    ):
+        super().__init__()
+        variant_key = variant or getattr(Config, 'SAM2_VARIANT', 'tiny')
+        c1, c2, c3, c4 = self.SAM2_STAGE_CHANNELS.get(variant_key, (96, 192, 384, 768))
+        self.variant = variant_key
+        self.stage_channels = (c1, c2, c3, c4)
+        self.fpn_dim = fpn_dim
+
+        # 1. Multi-Scale Hiera Backbone Stages [C1, C2, C3, C4] at strides [4, 8, 16, 32]
+        # For 1024x1024 input -> [256x256, 128x128, 64x64, 32x32]
+        self.stage1 = HieraWindowStage(in_ch, c1, stride=4, window_size=8, num_heads=4)
+        self.stage2 = HieraWindowStage(c1, c2, stride=2, window_size=8, num_heads=4)
+        self.stage3 = HieraWindowStage(c2, c3, stride=2, window_size=8, num_heads=8)
+        self.stage4 = HieraWindowStage(c3, c4, stride=2, window_size=8, num_heads=8)
+
+        # Skip adapters aligning MagAgentU2Net encoder (e3 @ stride 4, b @ stride 8) with C1, C2
+        self.e3_to_c1 = nn.Conv2d(e3_ch, c1, 1, bias=False)
+        self.b_to_c2 = nn.Conv2d(vis_ch, c2, 1, bias=False)
+
+        # 2. SAM 2 Top-Down FPN Neck (projects [C1, C2, C3, C4] -> 256-d pyramid [P1, P2, P3, P4])
+        self.lat1 = nn.Conv2d(c1, fpn_dim, 1, bias=False)
+        self.lat2 = nn.Conv2d(c2, fpn_dim, 1, bias=False)
+        self.lat3 = nn.Conv2d(c3, fpn_dim, 1, bias=False)
+        self.lat4 = nn.Conv2d(c4, fpn_dim, 1, bias=False)
+        self.fpn_smooth1 = nn.Sequential(nn.Conv2d(fpn_dim, fpn_dim, 3, padding=1, bias=False), nn.BatchNorm2d(fpn_dim), nn.GELU())
+        self.fpn_smooth2 = nn.Sequential(nn.Conv2d(fpn_dim, fpn_dim, 3, padding=1, bias=False), nn.BatchNorm2d(fpn_dim), nn.GELU())
+
+        # 3. Learnable SAM 2 Mask-Query Tokens (filament spine/barb queries vs sunspot/limb distractors)
+        gen = torch.Generator().manual_seed(42)
+        fg_init = F.normalize(torch.randn(num_queries, fpn_dim, generator=gen), dim=-1)
+        bg_init = F.normalize(torch.randn(num_queries, fpn_dim, generator=gen), dim=-1)
+        self.register_buffer("pos_anchors", fg_init)
+        self.register_buffer("neg_anchors", bg_init)
+        self.fg_queries = nn.Parameter(torch.zeros(num_queries, fpn_dim))
+        self.bg_queries = nn.Parameter(torch.zeros(num_queries, fpn_dim))
+
+        # Two-Way Token-to-Image and Image-to-Token Cross-Attention (SAM 2 Mask Decoder style)
+        self.token_to_img_attn = nn.MultiheadAttention(fpn_dim, num_heads=8, batch_first=True)
+        self.img_to_token_attn = nn.MultiheadAttention(fpn_dim, num_heads=8, batch_first=True)
+
+        # Residual fusion gates into MagAgentU2Net e3 (256-ch @ H/4) and bottleneck b (512-ch @ H/8)
+        self.e3_gate = nn.Sequential(
+            nn.Conv2d(fpn_dim, e3_ch, 1, bias=False),
+            nn.BatchNorm2d(e3_ch),
+            nn.Sigmoid(),
+        )
+        self.b_out = nn.Sequential(
+            nn.Conv2d(fpn_dim + 2, vis_ch, 1, bias=False),
             nn.BatchNorm2d(vis_ch),
             nn.Sigmoid(),
         )
-        # FiLM modulation generator (CLIPSeg, CVPR 2022) for the 64-ch CognitiveRefiner
+        # FiLM conditioning head for the full-resolution 64-ch CognitiveRefiner
         self.film_head = nn.Sequential(
-            nn.Linear(proj_dim, refiner_ch * 2),
+            nn.Linear(fpn_dim, refiner_ch * 2),
             nn.Tanh(),
         )
         self.logit_scale = nn.Parameter(torch.tensor(np.log(10.0), dtype=torch.float32))
 
     @torch.no_grad()
-    def preload_clip_anchors(self, model_name=Config.VLM_MODEL_NAME, device='cpu'):
-        """Preload frozen CLIP text embeddings before training and store in buffers."""
-        if not HAS_TRANSFORMERS:
-            print("transformers not installed; using deterministic VLM anchor buffers.")
-            return False
-        try:
-            tokenizer = CLIPTokenizer.from_pretrained(model_name)
-            text_Encoder = CLIPTextModel.from_pretrained(model_name).to(device).eval()
-            for prompts, buf_name in ((self.POSITIVE_PROMPTS, "pos_anchors"), (self.NEGATIVE_PROMPTS, "neg_anchors")):
-                tokens = tokenizer(list(prompts), padding=True, truncation=True, return_tensors="pt").to(device)
-                pooled = text_Encoder(**tokens).pooler_output.float()
-                pooled = F.normalize(pooled, dim=-1)
-                if pooled.shape[-1] == getattr(self, buf_name).shape[-1]:
-                    getattr(self, buf_name).copy_(pooled.to(getattr(self, buf_name).device))
-            del text_Encoder
-            print(f"✓ Preloaded VLM text anchors from {model_name}")
-            return True
-        except Exception as exc:
-            print(f"VLM preload fallback (offline/cached anchors used): {exc}")
-            return False
+    def _copy_matching_tensors(self, src_sd, source_label):
+        """Copies shape- and suffix-matched tensors from a pretrained state_dict into self."""
+        if isinstance(src_sd, dict) and 'model' in src_sd and isinstance(src_sd['model'], dict):
+            src_sd = src_sd['model']
+        elif isinstance(src_sd, dict) and 'state_dict' in src_sd and isinstance(src_sd['state_dict'], dict):
+            src_sd = src_sd['state_dict']
+        dst_sd = self.state_dict()
+        used_src = set()
+        matched = 0
+        for k_dst, v_dst in dst_sd.items():
+            for k_src, v_src in src_sd.items():
+                if k_src in used_src or not isinstance(v_src, torch.Tensor):
+                    continue
+                if v_src.shape == v_dst.shape and k_dst.split('.')[-1] == k_src.split('.')[-1]:
+                    v_dst.copy_(v_src.to(v_dst.device, dtype=v_dst.dtype))
+                    used_src.add(k_src)
+                    matched += 1
+                    break
+        if matched > 0:
+            print(f"✓ Preloaded SAM 2 Hiera ({source_label}) into VLMSemanticBridge ({matched} tensors)")
+        return matched > 0
 
-    def forward(self, b):
+    @torch.no_grad()
+    def preload_sam2_hiera(self, model_name=Config.VLM_MODEL_NAME, device='cpu'):
+        """
+        Preloads matching pretrained SAM 2 Hiera weights from:
+        1. A direct checkpoint file (.pt / .pth / .bin / .safetensors) uploaded as a Kaggle Dataset
+        2. A local Kaggle Dataset directory or HuggingFace repo ID (`facebook/sam2-hiera-tiny` or `facebook/sam2-hiera-base-plus`)
+        3. `timm` (`sam2_hiera_tiny` / `sam2_hiera_base_plus`)
+        Falls back cleanly to initialized weights if offline with no dataset attached.
+        """
+        # 1. Direct checkpoint file (.pt / .pth / .bin) or directory containing a .pt/.pth file
+        if isinstance(model_name, str) and os.path.exists(model_name):
+            ckpt_file = None
+            if os.path.isfile(model_name):
+                ckpt_file = model_name
+            elif os.path.isdir(model_name):
+                candidates = (
+                    glob.glob(os.path.join(model_name, "*.pt"))
+                    + glob.glob(os.path.join(model_name, "*.pth"))
+                    + glob.glob(os.path.join(model_name, "*.bin"))
+                )
+                if candidates and not os.path.exists(os.path.join(model_name, "config.json")):
+                    ckpt_file = candidates[0]
+            if ckpt_file is not None:
+                try:
+                    raw_sd = torch.load(ckpt_file, map_location=device, weights_only=False)
+                    if self._copy_matching_tensors(raw_sd, ckpt_file):
+                        return True
+                except Exception as exc:
+                    print(f"SAM 2 checkpoint file load note ({ckpt_file}): {exc}")
+
+        # 2. HuggingFace repo ID or local HuggingFace Dataset directory (containing config.json + model.safetensors)
+        if HAS_TRANSFORMERS:
+            try:
+                hf_model = AutoModel.from_pretrained(model_name).to(device).eval()
+                loaded = self._copy_matching_tensors(hf_model.state_dict(), model_name)
+                del hf_model
+                if loaded:
+                    return True
+            except Exception as exc:
+                print(f"SAM 2 Hiera HF preload fallback (using initialized Hiera + FPN weights): {exc}")
+
+        # 3. timm fallback
+        if HAS_TIMM:
+            try:
+                timm_name = 'sam2_hiera_base_plus' if 'base' in str(model_name) else 'sam2_hiera_tiny'
+                backbone = timm.create_model(timm_name, pretrained=True, features_only=True).to(device).eval()
+                loaded = self._copy_matching_tensors(backbone.state_dict(), timm_name)
+                del backbone
+                if loaded:
+                    return True
+            except Exception:
+                pass
+        return False
+
+    # Alias kept for backward compatibility with main() / existing callers
+    preload_clip_anchors = preload_sam2_hiera
+
+    def forward(self, b, x=None, e3=None):
         """
         Args:
-            b: Bottleneck features [B, 512, H_b, W_b]
+            b: Bottleneck features [B, 512, H/8, W/8]
+            x: Optional raw 3-channel input [B, 3, H, W] (1024x1024)
+            e3: Optional stride-4 encoder skip [B, 256, H/4, W/4] (256x256)
         Returns:
-            b_mod: VLM-modulated bottleneck [B, 512, H_b, W_b]
-            vlm_logits: Contrastive semantic prior logits [B, 1, H_b, W_b]
-            gamma, beta: FiLM modulation tensors [B, 64, 1, 1]
+            If e3 is provided: (e3_mod, b_mod, vlm_logits, gamma, beta)
+            If e3 is None:     (b_mod, vlm_logits, gamma, beta)
         """
-        B, C, H, W = b.shape
-        pos_emb = F.normalize(self.txt_proj(F.normalize(self.pos_anchors + self.pos_ctx, dim=-1)), dim=-1)
-        neg_emb = F.normalize(self.txt_proj(F.normalize(self.neg_anchors + self.neg_ctx, dim=-1)), dim=-1)
+        B, _, Hb, Wb = b.shape
+        H4, W4 = Hb * 2, Wb * 2
 
-        vis_feat = self.vis_proj(b)  # [B, D, H, W]
-        vis_norm = F.normalize(vis_feat, dim=1)
+        # Extract multi-scale Hiera stages [C1, C2, C3, C4] at strides [4, 8, 16, 32]
+        if x is not None:
+            c1 = self.stage1(x)
+        elif e3 is not None:
+            c1 = self.stage1.dw_conv(self.e3_to_c1(e3))
+        else:
+            b_up = F.interpolate(b, size=(H4, W4), mode='bilinear', align_corners=False)
+            c1 = self.stage1.dw_conv(self.b_to_c2(b_up)[:, :self.stage_channels[0]])
+
+        if e3 is not None:
+            if c1.shape[2:] != e3.shape[2:]:
+                c1 = F.interpolate(c1, size=e3.shape[2:], mode='bilinear', align_corners=False)
+            c1 = c1 + self.e3_to_c1(e3)
+
+        c2 = self.stage2(c1)
+        if c2.shape[2:] != (Hb, Wb):
+            c2 = F.interpolate(c2, size=(Hb, Wb), mode='bilinear', align_corners=False)
+        c2 = c2 + self.b_to_c2(b)
+        c3 = self.stage3(c2)
+        c4 = self.stage4(c3)
+
+        # Top-down FPN fusion across [C1, C2, C3, C4]
+        p4 = self.lat4(c4)
+        p3 = self.lat3(c3) + F.interpolate(p4, size=c3.shape[2:], mode='bilinear', align_corners=False)
+        p2 = self.fpn_smooth2(
+            self.lat2(c2) + F.interpolate(p3, size=c2.shape[2:], mode='bilinear', align_corners=False)
+        )
+        p1 = self.fpn_smooth1(
+            self.lat1(c1) + F.interpolate(p2, size=c1.shape[2:], mode='bilinear', align_corners=False)
+        )
+
+        # SAM 2 Mask-Query Token Decoder at stride-8 FPN feature map P2
+        fg_q = F.normalize(self.pos_anchors + self.fg_queries, dim=-1)  # [Q, D]
+        bg_q = F.normalize(self.neg_anchors + self.bg_queries, dim=-1)  # [Q, D]
+        all_queries = torch.cat([fg_q, bg_q], dim=0).unsqueeze(0).expand(B, -1, -1)  # [B, 2Q, D]
+
+        img_tokens = p2.flatten(2).transpose(1, 2)  # [B, Hb*Wb, D]
+        refined_q, _ = self.token_to_img_attn(all_queries, img_tokens, img_tokens, need_weights=False)
+        all_queries = all_queries + refined_q
+        attn_out, _ = self.img_to_token_attn(img_tokens, all_queries, all_queries, need_weights=False)
+        attn_map = p2 + attn_out.transpose(1, 2).reshape(B, self.fpn_dim, Hb, Wb)
+
+        # Mask-Query dot-product similarity maps (foreground filament spines vs background sunspots)
+        Q = fg_q.shape[0]
+        fg_refined = F.normalize(all_queries[:, :Q, :], dim=-1)
+        bg_refined = F.normalize(all_queries[:, Q:, :], dim=-1)
+        p2_norm = F.normalize(attn_map, dim=1)
         scale = self.logit_scale.exp().clamp(1.0, 50.0)
 
-        # Dense Pixel-Text Contrastive Similarity Maps (DenseCLIP)
-        sim_pos = torch.einsum("bdhw,kd->bkhw", vis_norm, pos_emb).mean(dim=1, keepdim=True) * scale
-        sim_neg = torch.einsum("bdhw,kd->bkhw", vis_norm, neg_emb).mean(dim=1, keepdim=True) * scale
-        vlm_logits = sim_pos - sim_neg  # Positive where filament > sunspot/limb distractor
+        sim_fg = torch.einsum("bdhw,bqd->bqhw", p2_norm, fg_refined).mean(dim=1, keepdim=True) * scale
+        sim_bg = torch.einsum("bdhw,bqd->bqhw", p2_norm, bg_refined).mean(dim=1, keepdim=True) * scale
+        vlm_logits = sim_fg - sim_bg
 
-        # Vision-Language Cross-Attention (CRIS)
-        tokens_q = vis_feat.flatten(2).transpose(1, 2)  # [B, H*W, D]
-        all_txt = torch.cat([pos_emb, neg_emb], dim=0).unsqueeze(0).expand(B, -1, -1)  # [B, K, D]
-        attn_out, _ = self.cross_attn(tokens_q, all_txt, all_txt, need_weights=False)
-        attn_map = attn_out.transpose(1, 2).reshape(B, -1, H, W)
+        # Modulate bottleneck b [B, 512, H/8, W/8] and high-res skip e3 [B, 256, H/4, W/4]
+        b_gate = self.b_out(torch.cat([attn_map, torch.sigmoid(sim_fg), torch.sigmoid(sim_bg)], dim=1))
+        b_mod = b * (1.0 + b_gate)
 
-        gate = self.vis_out(torch.cat([attn_map, torch.sigmoid(sim_pos), torch.sigmoid(sim_neg)], dim=1))
-        b_mod = b * (1.0 + gate)
-
-        # Global VLM context -> FiLM (gamma, beta) for high-res CognitiveRefiner
-        vlm_pool = attn_out.mean(dim=1)  # [B, D]
-        gamma_beta = self.film_head(vlm_pool).unsqueeze(-1).unsqueeze(-1)
+        # Global query context -> FiLM (gamma, beta) for full-res CognitiveRefiner
+        query_pool = all_queries.mean(dim=1)  # [B, D]
+        gamma_beta = self.film_head(query_pool).unsqueeze(-1).unsqueeze(-1)
         gamma, beta = torch.chunk(gamma_beta, 2, dim=1)
+
+        if e3 is not None:
+            e3_mod = e3 * (1.0 + 0.5 * self.e3_gate(p1))
+            return e3_mod, b_mod, vlm_logits, gamma, beta
         return b_mod, vlm_logits, gamma, beta
 
 
@@ -605,7 +896,7 @@ class MagAgentU2Net(nn.Module):
         
         # === BOTTLENECK ===
         self.bottleneck = RSU(256, 256, 512)
-        self.vlm_bridge = VLMSemanticBridge(vis_ch=512, refiner_ch=64)
+        self.vlm_bridge = VLMSemanticBridge(in_ch=in_ch, e3_ch=256, vis_ch=512, refiner_ch=64)
         
         # === DECODER with Attention Gates ===
         self.up3 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
@@ -639,9 +930,9 @@ class MagAgentU2Net(nn.Module):
         e2 = self.enc2(self.pool1(e1))
         e3 = self.enc3(self.pool2(e2))
         
-        # Bottleneck + VLM Semantic Conditioning
+        # Bottleneck + SAM 2 Hiera Multi-Scale FPN & Mask-Query Conditioning
         b = self.bottleneck(self.pool3(e3))
-        b, vlm_logits, gamma, beta = self.vlm_bridge(b)
+        e3, b, vlm_logits, gamma, beta = self.vlm_bridge(b, x=x, e3=e3)
         
         # Decoder path with Attention Gates
         d3 = self.up3(b)
@@ -666,57 +957,144 @@ class MagAgentU2Net(nn.Module):
         return out
 
 # %% [code] {"execution":{"iopub.status.busy":"2026-10-17T10:17:42.455368Z","iopub.execute_input":"2026-10-17T10:17:42.455610Z","iopub.status.idle":"2026-10-17T10:17:42.470128Z","shell.execute_reply.started":"2026-10-17T10:17:42.455593Z","shell.execute_reply":"2026-10-17T10:17:42.469456Z"}}
-# CELL 6: Combined Dice + BCE + Skeleton Recall + VLM Prior Loss Function
-# Dice Loss: Handles severe class imbalance (filaments are <5% of pixels)
-# BCE Loss: Provides stable gradients for precise boundary detection
-# Skeleton Recall Loss (Kirchhoff et al., ECCV 2024): Preserves spine continuity on a single head
-# VLM Contrastive Prior Loss: Grounds bottleneck VLM similarity on true filament regions
+# CELL 6: Topology-Preserving Compound Loss Function (DiceBCELoss)
+# Total Loss = 1.0 * Dice + 1.0 * Focal(alpha=0.50, gamma=2.0) + w_lovasz * LovaszHinge + 0.25 * SkeletonRecall
+# - Focal Polarity Fix: alpha=0.50 (neutral foreground/background balance; avoids alpha=0.25 thin-neck snapping
+#   and avoids >0.75 1-2px halo merging between adjacent filaments).
+# - FP16 AMP Stability: LovaszHinge (Berman et al., CVPR 2018) is computed strictly inside
+#   `torch.amp.autocast('cuda', enabled=False)` with logits cast to `.float()`.
+#   `w_lovasz` linearly warms up from 0.0 to 0.50 across epochs 1 to 5.
+# - Skeleton Recall (Kirchhoff et al., ECCV 2024): Soft recall against 1px-dilated morphological
+#   centerlines precomputed on CPU in SolarDataset to preserve spine continuity for Panoptic Quality (PQ).
+
+def _lovasz_grad(gt_sorted):
+    """Computes gradient of the Lovasz extension w.r.t sorted errors (Berman et al., CVPR 2018)."""
+    p = len(gt_sorted)
+    gts = gt_sorted.sum()
+    intersection = gts - gt_sorted.float().cumsum(0)
+    union = gts + (1.0 - gt_sorted.float()).cumsum(0)
+    jaccard = 1.0 - intersection / union.clamp_min(1e-6)
+    if p > 1:
+        jaccard[1:p] = jaccard[1:p] - jaccard[0:-1]
+    return jaccard
+
+
+def _lovasz_hinge_flat(logits_flat, labels_flat):
+    """Binary Lovasz hinge loss on flattened 1D tensors in float32."""
+    if logits_flat.numel() == 0:
+        return logits_flat.sum() * 0.0
+    signs = 2.0 * labels_flat.float() - 1.0
+    errors = 1.0 - logits_flat * signs
+    errors_sorted, perm = torch.sort(errors, dim=0, descending=True)
+    gt_sorted = labels_flat[perm]
+    grad = _lovasz_grad(gt_sorted)
+    return torch.dot(F.relu(errors_sorted), grad)
+
+
+def lovasz_hinge_loss(logits, targets, per_image=True):
+    """
+    Per-image Lovasz-Hinge loss strictly evaluated in FP32 (`autocast('cuda', enabled=False)`).
+    Directly optimizes the submodular Jaccard / IoU surface for thin solar filament structures.
+    """
+    with torch.amp.autocast('cuda', enabled=False):
+        logits_f = logits.float()
+        targets_f = targets.float()
+        if per_image:
+            losses = [
+                _lovasz_hinge_flat(log_i.reshape(-1), tgt_i.reshape(-1))
+                for log_i, tgt_i in zip(logits_f, targets_f)
+            ]
+            return torch.stack(losses).mean()
+        return _lovasz_hinge_flat(logits_f.reshape(-1), targets_f.reshape(-1))
+
 
 class DiceBCELoss(nn.Module):
-    def __init__(self, skel_weight=Config.SKEL_RECALL_WEIGHT, vlm_weight=Config.VLM_PRIOR_WEIGHT):
+    def __init__(
+        self,
+        dice_weight=Config.DICE_WEIGHT,
+        focal_weight=Config.FOCAL_WEIGHT,
+        focal_alpha=Config.FOCAL_ALPHA,
+        focal_gamma=Config.FOCAL_GAMMA,
+        lovasz_max_weight=Config.LOVASZ_MAX_WEIGHT,
+        lovasz_warmup_epochs=Config.LOVASZ_WARMUP_EPOCHS,
+        skel_weight=Config.SKEL_RECALL_WEIGHT,
+        vlm_weight=Config.VLM_PRIOR_WEIGHT,
+    ):
         super().__init__()
-        self.bce = nn.BCEWithLogitsLoss()
+        self.bce_none = nn.BCEWithLogitsLoss(reduction='none')
+        self.bce_mean = nn.BCEWithLogitsLoss()
+        self.dice_weight = dice_weight
+        self.focal_weight = focal_weight
+        self.focal_alpha = float(np.clip(focal_alpha, 0.50, 0.65))
+        self.focal_gamma = focal_gamma
+        self.lovasz_max_weight = lovasz_max_weight
+        self.lovasz_warmup_epochs = lovasz_warmup_epochs
         self.skel_weight = skel_weight
         self.vlm_weight = vlm_weight
 
-    def forward(self, logits, targets, spine_targets=None, vlm_logits=None):
+    def get_lovasz_weight(self, epoch=1):
+        """
+        Linearly warms up w_lovasz from 0.0 to 0.50 across epochs 1 to 5
+        (1-indexed epoch 1 -> 0.00, 2 -> 0.125, 3 -> 0.25, 4 -> 0.375, >=5 -> 0.50).
+        """
+        if self.lovasz_max_weight <= 0:
+            return 0.0
+        if self.lovasz_warmup_epochs <= 1:
+            return float(self.lovasz_max_weight)
+        ep = max(1, int(epoch))
+        progress = float(ep - 1) / float(self.lovasz_warmup_epochs - 1)
+        return float(self.lovasz_max_weight * min(1.0, max(0.0, progress)))
+
+    def forward(self, logits, targets, spine_targets=None, vlm_logits=None, epoch=5):
         """
         Args:
             logits: Raw model output (before sigmoid) [B, 1, H, W]
             targets: Ground truth binary mask [B, 1, H, W]
-            spine_targets: Optional dilated ground-truth filament spine mask [B, 1, H, W]
-            vlm_logits: Optional bottleneck VLM contrastive logits [B, 1, H/8, W/8]
+            spine_targets: Precomputed 1px-dilated morphological centerline mask [B, 1, H, W]
+            vlm_logits: Optional bottleneck SAM 2 Hiera query logits [B, 1, H/8, W/8]
+            epoch: 1-indexed training epoch (1..EPOCHS) for linear Lovasz warmup (defaults to 5 = full 0.50 weight)
         Returns:
-            Combined loss scalar
+            Combined topology-preserving loss scalar
         """
-        logits_f = logits.float()
-        targets_f = targets.float()
+        with torch.amp.autocast('cuda', enabled=False):
+            logits_f = logits.float()
+            targets_f = targets.float()
 
-        # Dice Loss (computed in float32 for AMP stability)
-        probs = torch.sigmoid(logits_f)
-        smooth = 1.0
-        iflat = probs.view(-1)
-        tflat = targets_f.view(-1)
-        intersection = (iflat * tflat).sum()
-        dice_loss = 1 - ((2. * intersection + smooth) / 
-                         (iflat.sum() + tflat.sum() + smooth))
-        
-        # BCE Loss (with logits - numerically stable)
-        bce_loss = self.bce(logits_f, targets_f)
-        total_loss = dice_loss + bce_loss
+            # 1. Soft Dice Loss (weight = 1.0)
+            probs = torch.sigmoid(logits_f)
+            smooth = 1.0
+            iflat = probs.reshape(-1)
+            tflat = targets_f.reshape(-1)
+            intersection = (iflat * tflat).sum()
+            dice_loss = 1.0 - ((2.0 * intersection + smooth) / (iflat.sum() + tflat.sum() + smooth))
 
-        # Skeleton Recall Loss (ECCV 2024): penalizes false breaks along filament spines
-        if spine_targets is not None and self.skel_weight > 0:
-            sflat = spine_targets.float().view(-1)
-            skel_recall = ((iflat * sflat).sum() + smooth) / (sflat.sum() + smooth)
-            total_loss = total_loss + self.skel_weight * (1.0 - skel_recall)
+            # 2. Binary Focal Loss with neutral alpha=0.50, gamma=2.0 (weight = 1.0)
+            bce_per_pixel = self.bce_none(logits_f, targets_f)
+            p_t = probs * targets_f + (1.0 - probs) * (1.0 - targets_f)
+            alpha_t = self.focal_alpha * targets_f + (1.0 - self.focal_alpha) * (1.0 - targets_f)
+            focal_weight_map = alpha_t * torch.pow((1.0 - p_t).clamp_min(1e-6), self.focal_gamma)
+            focal_loss = (focal_weight_map * bce_per_pixel).mean()
 
-        # Bottleneck VLM Contrastive Prior Supervision
-        if vlm_logits is not None and self.vlm_weight > 0:
-            vlm_target = F.adaptive_max_pool2d(targets_f, output_size=vlm_logits.shape[2:])
-            vlm_loss = self.bce(vlm_logits.float(), vlm_target)
-            total_loss = total_loss + self.vlm_weight * vlm_loss
-        
+            total_loss = self.dice_weight * dice_loss + self.focal_weight * focal_loss
+
+            # 3. Lovasz-Hinge Loss in strict FP32 with linear warmup across epochs 1..5
+            w_lovasz = self.get_lovasz_weight(epoch)
+            if w_lovasz > 0.0:
+                lovasz_loss = lovasz_hinge_loss(logits_f, targets_f, per_image=True)
+                total_loss = total_loss + w_lovasz * lovasz_loss
+
+            # 4. Skeleton Recall Loss (weight = 0.25): soft recall on 1px-dilated centerlines
+            if spine_targets is not None and self.skel_weight > 0:
+                sflat = spine_targets.float().reshape(-1)
+                skel_recall = ((iflat * sflat).sum() + smooth) / (sflat.sum() + smooth)
+                total_loss = total_loss + self.skel_weight * (1.0 - skel_recall)
+
+            # 5. Auxiliary SAM 2 Hiera Query Supervision
+            if vlm_logits is not None and self.vlm_weight > 0:
+                vlm_target = F.adaptive_max_pool2d(targets_f, output_size=vlm_logits.shape[2:])
+                vlm_loss = self.bce_mean(vlm_logits.float(), vlm_target)
+                total_loss = total_loss + self.vlm_weight * vlm_loss
+
         return total_loss
 
 # %% [code] {"execution":{"iopub.status.busy":"2026-10-17T10:17:42.470986Z","iopub.execute_input":"2026-10-17T10:17:42.471330Z","iopub.status.idle":"2026-10-17T10:17:42.487967Z","shell.execute_reply.started":"2026-10-17T10:17:42.471300Z","shell.execute_reply":"2026-10-17T10:17:42.487125Z"}}
@@ -726,7 +1104,7 @@ class DiceBCELoss(nn.Module):
 #   - 50% less VRAM usage (critical for 1024x1024 images)
 # Gradient clipping prevents exploding gradients with BCE loss.
 
-def train_epoch(model, loader, optimizer, criterion, scaler):
+def train_epoch(model, loader, optimizer, criterion, scaler, epoch=1):
     """Train for one epoch. Returns average loss."""
     model.train()
     epoch_loss = 0
@@ -734,7 +1112,7 @@ def train_epoch(model, loader, optimizer, criterion, scaler):
     optimizer.zero_grad(set_to_none=True)
     remainder = len(loader) % Config.ACCUM_STEPS
 
-    for step, batch in enumerate(tqdm(loader, desc="Training")):
+    for step, batch in enumerate(tqdm(loader, desc=f"Training (Ep {epoch})")):
         if len(batch) == 3:
             images, masks, spines = batch
             spines = spines.to(Config.DEVICE, non_blocking=True)
@@ -754,7 +1132,9 @@ def train_epoch(model, loader, optimizer, criterion, scaler):
         # Mixed precision forward pass
         with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=Config.DEVICE == 'cuda'):
             logits, vlm_logits = model(images, return_aux=True)
-            loss = criterion(logits, masks, spine_targets=spines, vlm_logits=vlm_logits) / accumulation_divisor
+            loss = criterion(
+                logits, masks, spine_targets=spines, vlm_logits=vlm_logits, epoch=epoch
+            ) / accumulation_divisor
         
         # Scaled backward pass
         scaler.scale(loss).backward()
@@ -771,7 +1151,7 @@ def train_epoch(model, loader, optimizer, criterion, scaler):
     
     return epoch_loss / len(loader)
 
-def validate(model, loader, criterion):
+def validate(model, loader, criterion, epoch=5):
     """Validate model. Returns average loss."""
     model.eval()
     epoch_loss = 0
@@ -789,7 +1169,9 @@ def validate(model, loader, criterion):
             
             with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=Config.DEVICE == 'cuda'):
                 logits, vlm_logits = model(images, return_aux=True)
-                loss = criterion(logits, masks, spine_targets=spines, vlm_logits=vlm_logits)
+                loss = criterion(
+                    logits, masks, spine_targets=spines, vlm_logits=vlm_logits, epoch=epoch
+                )
             
             epoch_loss += loss.item()
     
@@ -823,18 +1205,76 @@ def pycoco_rle_encode(img):
     rle = maskUtils.encode(np.asfortranarray(img.astype(np.uint8)))
     return rle['counts'].decode('utf-8')
 
-def predict_probability(model, tensor, use_tta=Config.USE_TTA):
-    """Predict full-resolution [1, 1, 2048, 2048] probability map with optional 4-fold TTA."""
+def build_gaussian_window(size=Config.IMG_SIZE, sigma=Config.GAUSSIAN_SIGMA, device='cpu'):
+    """Builds a 2D Gaussian weighting window [1, 1, size, size] for seamless tile stitching."""
+    coords = torch.arange(size, dtype=torch.float32, device=device) - (size - 1) / 2.0
+    g1d = torch.exp(-(coords ** 2) / (2.0 * (sigma ** 2)))
+    g2d = torch.outer(g1d, g1d)
+    g2d = g2d / g2d.max().clamp_min(1e-8)
+    return g2d.view(1, 1, size, size)
+
+
+def _predict_single_view(model, tensor, use_tta=False):
+    """Predicts a probability map for a single [B, 3, H, W] tensor with optional 4-fold TTA."""
     with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=Config.DEVICE == 'cuda'):
         p0 = torch.sigmoid(model(tensor).float())
         if not use_tta:
-            probs_1024 = p0
-        else:
-            ph = torch.flip(torch.sigmoid(model(torch.flip(tensor, dims=[-1])).float()), dims=[-1])
-            pv = torch.flip(torch.sigmoid(model(torch.flip(tensor, dims=[-2])).float()), dims=[-2])
-            pr = torch.rot90(torch.sigmoid(model(torch.rot90(tensor, 1, dims=[-2, -1])).float()), -1, dims=[-2, -1])
-            probs_1024 = 0.25 * (p0 + ph + pv + pr)
-    return F.interpolate(probs_1024, size=(Config.ORIGINAL_SIZE, Config.ORIGINAL_SIZE), mode='bilinear', align_corners=False)
+            return p0
+        ph = torch.flip(torch.sigmoid(model(torch.flip(tensor, dims=[-1])).float()), dims=[-1])
+        pv = torch.flip(torch.sigmoid(model(torch.flip(tensor, dims=[-2])).float()), dims=[-2])
+        pr = torch.rot90(torch.sigmoid(model(torch.rot90(tensor, 1, dims=[-2, -1])).float()), -1, dims=[-2, -1])
+        return 0.25 * (p0 + ph + pv + pr)
+
+
+def predict_probability(model, tensor, use_tta=Config.USE_TTA):
+    """
+    Predicts full-resolution [1, 1, 2048, 2048] probability map using:
+    1. Global full-disk context view (P_global): downsampled to 1024x1024 (with TTA) and upsampled to 2048x2048.
+    2. High-resolution 3x3 sliding window of 1024x1024 native tiles (stride=512, 50% overlap)
+       weighted by a 2D Gaussian window (sigma=256) to form P_local.
+    3. Anti-Breakage Gated Fusion:
+       P_final = (P_global > 0.05).float() * (0.85 * P_local + 0.15 * P_global)
+    """
+    _, _, H, W = tensor.shape
+    tile_size = Config.IMG_SIZE
+    orig_size = Config.ORIGINAL_SIZE
+
+    # If caller passes an already-downscaled 1024x1024 tensor, evaluate and upsample cleanly
+    if H < orig_size or W < orig_size:
+        probs_1024 = _predict_single_view(model, tensor, use_tta=use_tta)
+        return F.interpolate(probs_1024, size=(orig_size, orig_size), mode='bilinear', align_corners=False)
+
+    # 1. Global full-disk view P_global
+    tensor_global = F.interpolate(tensor, size=(tile_size, tile_size), mode='bilinear', align_corners=False)
+    p_global_1024 = _predict_single_view(model, tensor_global, use_tta=use_tta)
+    p_global = F.interpolate(p_global_1024, size=(H, W), mode='bilinear', align_corners=False)
+
+    # 2. 3x3 Sliding Window of 1024x1024 native tiles (stride=512, 50% overlap) weighted by 2D Gaussian
+    stride = getattr(Config, 'TILE_STRIDE', 512)
+    sigma = getattr(Config, 'GAUSSIAN_SIGMA', 256.0)
+    gauss_win = build_gaussian_window(size=tile_size, sigma=sigma, device=tensor.device)
+
+    y_starts = sorted(set(list(range(0, H - tile_size + 1, stride)) + [H - tile_size]))
+    x_starts = sorted(set(list(range(0, W - tile_size + 1, stride)) + [W - tile_size]))
+
+    accum_prob = torch.zeros((tensor.shape[0], 1, H, W), dtype=torch.float32, device=tensor.device)
+    accum_weight = torch.zeros((1, 1, H, W), dtype=torch.float32, device=tensor.device)
+
+    for y0 in y_starts:
+        for x0 in x_starts:
+            tile = tensor[:, :, y0:y0 + tile_size, x0:x0 + tile_size]
+            p_tile = _predict_single_view(model, tile, use_tta=False)
+            accum_prob[:, :, y0:y0 + tile_size, x0:x0 + tile_size] += p_tile * gauss_win
+            accum_weight[:, :, y0:y0 + tile_size, x0:x0 + tile_size] += gauss_win
+
+    p_local = accum_prob / accum_weight.clamp_min(1e-6)
+
+    # 3. Anti-Breakage Soft-Gated High-Resolution Fusion
+    gate_thresh = getattr(Config, 'GLOBAL_GATE_THRESH', 0.05)
+    w_local = getattr(Config, 'LOCAL_BLEND_WEIGHT', 0.85)
+    w_global = getattr(Config, 'GLOBAL_BLEND_WEIGHT', 0.15)
+    p_final = (p_global > gate_thresh).float() * (w_local * p_local + w_global * p_global)
+    return p_final
 
 def generate_submission(model, test_paths, out_path):
     """
@@ -859,17 +1299,15 @@ def generate_submission(model, test_paths, out_path):
             if img is None:
                 img = np.random.randint(0, 65535, (2048, 2048), dtype=np.uint16)
             
-            # Create 3-channel input
+            # Create native 2048x2048 3-channel input for 3x3 Gaussian-stitched + global gated inference
             img_3ch, _ = prepare_input_3ch(img)
-            img_1024 = cv2.resize(img_3ch, (Config.IMG_SIZE, Config.IMG_SIZE))
             
-            # Convert to tensor and predict
-            tensor = torch.tensor(img_1024).permute(2, 0, 1).unsqueeze(0).to(
+            # Convert native 2048x2048 image to tensor and predict with Gated Gaussian Stitching
+            tensor_2048 = torch.tensor(img_3ch).permute(2, 0, 1).unsqueeze(0).to(
                 Config.DEVICE, non_blocking=True
             )
             
-            # Smooth bilinear probability upscale to 2048x2048 before thresholding
-            prob_2048 = predict_probability(model, tensor, use_tta=Config.USE_TTA)
+            prob_2048 = predict_probability(model, tensor_2048, use_tta=Config.USE_TTA)
             pred_mask_2048 = (prob_2048 > Config.THRESHOLD).cpu().numpy().squeeze().astype(np.uint8)
             pred_mask_2048 = cv2.morphologyEx(pred_mask_2048, cv2.MORPH_CLOSE, close_kernel)
             
@@ -981,10 +1419,12 @@ def main():
     
     # === 3. Create Datasets and DataLoaders ===
     train_ds = SolarDataset(
-        coco, train_ids, Config.TRAIN_DIR, Config.IMG_SIZE, train_transforms, return_spine=True
+        coco, train_ids, Config.TRAIN_DIR, Config.IMG_SIZE, train_transforms,
+        return_spine=True, training=True
     )
     val_ds = SolarDataset(
-        coco, val_ids, Config.TRAIN_DIR, Config.IMG_SIZE, val_transforms, return_spine=True
+        coco, val_ids, Config.TRAIN_DIR, Config.IMG_SIZE, val_transforms,
+        return_spine=True, training=False
     )
     
     train_loader = DataLoader(
@@ -1036,8 +1476,8 @@ def main():
         print(f"Epoch {epoch+1}/{Config.EPOCHS}")
         print(f"{'='*40}")
         
-        train_loss = train_epoch(model, train_loader, optimizer, criterion, scaler)
-        val_loss = validate(model, val_loader, criterion)
+        train_loss = train_epoch(model, train_loader, optimizer, criterion, scaler, epoch=epoch + 1)
+        val_loss = validate(model, val_loader, criterion, epoch=epoch + 1)
         scheduler.step()
         
         print(f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")

@@ -1,16 +1,26 @@
-# CELL 1: Downloading important binaries and importing libraries
-# This cell installs all required packages and imports them.
-# - pycocotools: For reading COCO JSON annotations and RLE encoding for submission
-# - albumentations: For data augmentation (flips, rotations)
-# - optuna: For optional hyperparameter tuning
-# - timm: For potential pretrained backbones (optional)
+# V5: unchanged model architecture, guarded CUDA execution and recoverable training.
+# See docs/V5-Kaggle-runbook.md for modes, checkpoint migration and diagnostics.
 
-!pip install optuna albumentations pycocotools timm transformers -q
+# Kaggle setup cell if needed: %pip install albumentations pycocotools -q
+# This file is also ordinary Python: python V5-heavy-model.py
 
 import os
 import glob
 import random
-from collections import defaultdict
+import json
+import hashlib
+import inspect
+import platform
+import subprocess
+import time
+import uuid
+from pathlib import Path
+from collections import defaultdict, OrderedDict
+
+# Set before importing torch / initializing CUDA. Restart after a device fault.
+if os.getenv('V5_LAUNCH_BLOCKING', '0') == '1':
+    os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+os.environ.setdefault('NO_ALBUMENTATIONS_UPDATE', '1')
 import numpy as np
 import pandas as pd
 import cv2
@@ -18,7 +28,6 @@ cv2.setNumThreads(1)
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import warnings
-warnings.filterwarnings('ignore')
 
 import torch
 import torch.nn as nn
@@ -29,18 +38,6 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 from pycocotools.coco import COCO
 from pycocotools import mask as maskUtils
-
-try:
-    from transformers import AutoModel, CLIPTokenizer, CLIPTextModel
-    HAS_TRANSFORMERS = True
-except Exception:
-    HAS_TRANSFORMERS = False
-
-try:
-    import timm
-    HAS_TIMM = True
-except Exception:
-    HAS_TIMM = False
 
 print(f"PyTorch Version: {torch.__version__}")
 print(f"CUDA Available: {torch.cuda.is_available()}")
@@ -61,7 +58,7 @@ class Config:
     TRAIN_DIR = os.path.join(BASE_DIR, 'train/train_images')
     TEST_DIR = os.path.join(BASE_DIR, 'test/test_images')
     ANNOTATIONS_FILE = os.path.join(BASE_DIR, 'train/MAGFiLO_1.0_Annotations_kaggle2026_train.json')
-    OUT_DIR = '/kaggle/working/'
+    OUT_DIR = os.getenv('V5_OUT_DIR', '/kaggle/working/')
     
     # === IMAGE DIMENSIONS ===
     # GONG H-alpha images are 2048x2048.
@@ -75,11 +72,12 @@ class Config:
     # the effective batch size remains 4 without changing the architecture.
     BATCH_SIZE = 2
     ACCUM_STEPS = 2
-    EPOCHS = 25           # Total training epochs (converges with pretrained SAM 2 Hiera + cosine schedule)
+    EPOCHS = 25
     LR = 2e-4             # Learning rate (Adam optimizer)
     WEIGHT_DECAY = 1e-4   # L2 regularization
-    NUM_WORKERS = 2       # DataLoader workers (4 workers keep both T4 GPUs fed without CPU stalls)
-    DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+    NUM_WORKERS = int(os.getenv('V5_WORKERS', '2'))
+    GPU = int(os.getenv('V5_GPU', '0'))
+    DEVICE = f'cuda:{GPU}' if torch.cuda.is_available() else 'cpu'
     
     # === MODEL PARAMETERS ===
     IN_CHANNELS = 3       # [Limb-corrected H-alpha, Filament Valley Map, Magnetic Proxy Map]
@@ -94,13 +92,44 @@ class Config:
     MODEL_WEIGHTS_NAME = 'best_model.pth'
     VLM_WEIGHTS_NAME = 'best_vlm.pth'
 
+    # Architecture-preserving runtime controls. One-variable diagnosis: restart
+    # the Kaggle kernel between variants, especially after any CUDA fault.
+    MODE = os.getenv('V5_MODE', 'train')  # train, smoke, diagnose, benchmark, evaluate, submit
+    USE_DP = os.getenv('V5_USE_DP', '1') == '1'
+    MHA_FASTPATH = os.getenv('V5_MHA_FASTPATH', '0') == '1'
+    EVAL_SERIAL = os.getenv('V5_EVAL_SERIAL', '0') == '1'
+    EVAL_AMP = os.getenv('V5_EVAL_AMP', '1') == '1'
+    BRIDGE_AMP = os.getenv('V5_BRIDGE_AMP', '0') == '1'
+    CUDNN = os.getenv('V5_CUDNN', '1') == '1'
+    CUDNN_BENCHMARK = os.getenv('V5_CUDNN_BENCHMARK', '0') == '1'
+    SDP_BACKEND = os.getenv('V5_SDP', 'math')
+    DEBUG_SYNC = os.getenv('V5_DEBUG_SYNC', '0') == '1'
+    PREFLIGHT = os.getenv('V5_PREFLIGHT', '1') == '1'
+    PERSISTENT_WORKERS = os.getenv('V5_PERSISTENT_WORKERS', '0') == '1'
+    VAL_CACHE_ITEMS = int(os.getenv('V5_VAL_CACHE_ITEMS', '8'))  # bounded, per worker
+    PROGRESS_SECONDS = 10.0
+    PROFILE_WARMUP = 3
+    PROFILE_BATCHES = int(os.getenv('V5_PROFILE_BATCHES', '12'))
+    PROFILE_EPOCH = int(os.getenv('V5_PROFILE_EPOCH', '1'))
+    CAPTURE_BATCHES = int(os.getenv('V5_CAPTURE_BATCHES', '2'))
+    RESUME_PATH = os.getenv('V5_RESUME', '')
+    CHECKPOINT_PATH = os.getenv('V5_CHECKPOINT', '')
+    REPLAY_BATCH = os.getenv('V5_REPLAY_BATCH', '')
+    PRETRAINED_SOURCE = os.getenv('V5_PRETRAINED', '')
+    PRETRAINED_MAP = os.getenv('V5_PRETRAINED_MAP', '')  # JSON destination -> source keys
+    VAL_LOSS_EPOCH = 5  # fixed full objective; never change with training warmup
+    NATIVE_EVAL_LIMIT = int(os.getenv('V5_NATIVE_EVAL_LIMIT', '0'))  # 0 = entire holdout
+    NATIVE_EVAL_AFTER_TRAIN = os.getenv('V5_NATIVE_EVAL', '1') == '1'
+    EXPECTED_TEST_IMAGES = int(os.getenv('V5_EXPECTED_TEST_IMAGES', '180'))
+    PQ_IOU_THRESHOLD = 0.5
+
     # === MULTI-SCALE DATASET & TILING PARAMETERS ===
     CROP_PROB = 0.50              # 50% full-disk 1024x1024 views, 50% native 1024x1024 crops from 2048x2048
     FILAMENT_CENTER_PROB = 0.70   # Within native crops: 70% filament-centered (with jitter), 30% disk/limb bg
     CROP_JITTER = 256             # Random spatial jitter around filament pixels in native crops
     TILE_STRIDE = 512             # 3x3 sliding window of 1024x1024 native tiles (50% overlap)
     GAUSSIAN_SIGMA = 256.0        # 2D Gaussian window sigma for seamless tile stitching
-    GLOBAL_GATE_THRESH = 0.05     # Anti-breakage soft gate threshold on P_global
+    GLOBAL_GATE_THRESH = 0.05     # Hard global probability cutoff (preserved)
     LOCAL_BLEND_WEIGHT = 0.85     # High-resolution P_local weight
     GLOBAL_BLEND_WEIGHT = 0.15    # Global full-disk P_global weight
 
@@ -117,7 +146,7 @@ class Config:
     # === SUBMISSION PARAMETERS ===
     MIN_AREA = 200        # Minimum pixel area to count as a valid filament (filters noise)
     THRESHOLD = 0.4       # Probability threshold for binary mask
-    USE_TTA = True        # 4-fold test-time augmentation in probability space
+    USE_TTA = os.getenv('V5_TTA', '1') == '1'  # global TTA; native tiles remain unaugmented
 
 # Verify paths exist
 print(f"Train dir exists: {os.path.exists(Config.TRAIN_DIR)}")
@@ -146,6 +175,10 @@ def load_image(path):
     img = cv2.imread(path, cv2.IMREAD_ANYDEPTH)
     if img is None:
         img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        raise FileNotFoundError(f'Cannot decode image: {path}')
+    if img.ndim != 2 or img.size == 0 or not np.isfinite(img).all():
+        raise ValueError(f'Invalid grayscale image: {path}, shape={img.shape}')
     return img
 
 _DISK_MASK_CACHE = {}
@@ -297,6 +330,8 @@ class SolarDataset(Dataset):
         self.transforms = transforms
         self.return_spine = return_spine
         self.training = training
+        self.epoch = torch.zeros((), dtype=torch.int64).share_memory_()
+        self._image_cache = OrderedDict()
 
     def __len__(self):
         return len(self.img_ids)
@@ -350,6 +385,14 @@ class SolarDataset(Dataset):
         return y0, x0
 
     def __getitem__(self, idx):
+        # Epoch/index seeds make crop + augmentation replay independent of worker
+        # scheduling, including persistent workers and a resumed epoch boundary.
+        if self.training:
+            seed = (Config.SEED + int(self.epoch) * 1_000_003 + idx) % (2**32)
+            random.seed(seed)
+            np.random.seed(seed)
+            if self.transforms is not None:
+                self.transforms.set_random_seed(seed)
         img_id = self.img_ids[idx]
         
         # FIX 1: Direct dictionary access (avoids loadImgs string bug)
@@ -358,16 +401,16 @@ class SolarDataset(Dataset):
         img_path = os.path.join(self.img_dir, file_name)
         
         # Load and normalize image
-        img = load_image(img_path)
-        if img is None:
-            img = np.random.randint(0, 65535, (2048, 2048), dtype=np.uint16)
+        img = load_image(img_path) if self.training or file_name not in self._image_cache else None
+        if img is not None and img.shape != (Config.ORIGINAL_SIZE, Config.ORIGINAL_SIZE):
+            raise ValueError(f'Unexpected image dimensions: {img_path}: {img.shape}')
         
         # FIX 2: Direct dictionary access for annotations
         # coco.imgToAnns maps image_id directly to a list of annotation dicts
         anns = self.coco.imgToAnns.get(img_id, [])
         
         # Create combined binary mask at original 2048x2048 resolution in uint8 (4x less memory bandwidth)
-        mask_u8 = np.zeros((2048, 2048), dtype=np.uint8)
+        mask_u8 = np.zeros((Config.ORIGINAL_SIZE, Config.ORIGINAL_SIZE), dtype=np.uint8)
         for ann in anns:
             # annToMask handles the polygon_list format perfectly
             mask_u8 = np.maximum(mask_u8, self.coco.annToMask(ann))
@@ -377,7 +420,7 @@ class SolarDataset(Dataset):
         spine_2048 = rasterize_dilated_spine(anns, mask_2048, img_size=None)
         
         # Multi-Scale Sampling: 50% full-disk 1024x1024 views, 50% native 1024x1024 crops
-        # Lossless 32px halo crop (> 15px Gaussian radius) avoids blurring unused 75% of 2048x2048 image
+        # A 32px halo covers the filters; patch-local normalization is preserved.
         if self.training and random.random() < Config.CROP_PROB:
             y0, x0 = self._sample_native_crop_coords(mask_u8, anns=anns)
             img_f = img.astype(np.float32, copy=False)
@@ -401,8 +444,17 @@ class SolarDataset(Dataset):
             mask = (mask_2048[y0:y0 + self.img_size, x0:x0 + self.img_size] > 0.5).astype(np.float32)
             spine = (spine_2048[y0:y0 + self.img_size, x0:x0 + self.img_size] > 0.15).astype(np.float32)
         else:
-            img_3ch_2048, _ = prepare_input_3ch(img)
-            img_3ch = cv2.resize(img_3ch_2048, (self.img_size, self.img_size))
+            if not self.training and file_name in self._image_cache:
+                img_3ch = self._image_cache.pop(file_name)
+                self._image_cache[file_name] = img_3ch
+                img_3ch = img_3ch.copy()
+            else:
+                img_3ch_2048, _ = prepare_input_3ch(img)
+                img_3ch = cv2.resize(img_3ch_2048, (self.img_size, self.img_size))
+                if not self.training and Config.VAL_CACHE_ITEMS > 0:
+                    self._image_cache[file_name] = img_3ch.copy()
+                    while len(self._image_cache) > Config.VAL_CACHE_ITEMS:
+                        self._image_cache.popitem(last=False)
             mask = cv2.resize(mask_2048, (self.img_size, self.img_size))
             mask = (mask > 0.5).astype(np.float32)
             spine = cv2.resize(spine_2048, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR)
@@ -437,7 +489,7 @@ class SolarDataset(Dataset):
             spine = spine.unsqueeze(0).float()
         
         if self.return_spine:
-            return img_3ch, mask, spine
+            return img_3ch, mask, spine, str(img_id)
         return img_3ch, mask
 
 # Define augmentation pipelines (Keep these below the class)
@@ -549,13 +601,10 @@ class RSU(nn.Module):
         return d1 + x_in
 
 
-# --- 2.5 SAM 2 Hiera Multi-Scale Bridge (self.vlm_bridge) ---
-# Implements the SAM 2 Hiera multi-scale backbone + FPN Neck + Mask-Query Token Decoder
-# ("SAM 2: Segment Anything in Images and Videos", Ravi et al., ICLR 2025;
-#  "Hiera: A Hierarchical Vision Transformer without the Bells-and-Whistles", Ryali et al., ICML 2023).
-# - Default: facebook/sam2-hiera-tiny (channels [96, 192, 384, 768] at strides [4, 8, 16, 32])
-# - Configurable: sam2_hiera_base_plus via Config.SAM2_VARIANT = 'base_plus' ([112, 224, 448, 896])
-# - Strict checkpoint isolation: saved exclusively to `best_vlm.pth` while MagAgentU2Net saves to `best_model.pth`.
+# --- 2.5 Custom SAM-inspired visual bridge (self.vlm_bridge) ---
+# Four window stages + FPN + learned query decoder. The historical class/field
+# names are retained for state-dict compatibility. This is not SAM 2's backbone
+# and has no language encoder. Full-model checkpoints include the bridge.
 class HieraWindowStage(nn.Module):
     """Hierarchical Vision Transformer (Hiera) stage with local windowed self-attention + FFN."""
     def __init__(self, in_ch, out_ch, stride=1, window_size=8, num_heads=4):
@@ -643,7 +692,7 @@ class VLMSemanticBridge(nn.Module):
         self.e3_to_c1 = nn.Conv2d(e3_ch, c1, 1, bias=False)
         self.b_to_c2 = nn.Conv2d(vis_ch, c2, 1, bias=False)
 
-        # 2. SAM 2 Top-Down FPN Neck (projects [C1, C2, C3, C4] -> 256-d pyramid [P1, P2, P3, P4])
+        # 2. Custom top-down FPN (projects [C1, C2, C3, C4] -> a 256-d pyramid)
         self.lat1 = nn.Conv2d(c1, fpn_dim, 1, bias=False)
         self.lat2 = nn.Conv2d(c2, fpn_dim, 1, bias=False)
         self.lat3 = nn.Conv2d(c3, fpn_dim, 1, bias=False)
@@ -651,7 +700,7 @@ class VLMSemanticBridge(nn.Module):
         self.fpn_smooth1 = nn.Sequential(nn.Conv2d(fpn_dim, fpn_dim, 3, padding=1, bias=False), nn.BatchNorm2d(fpn_dim), nn.GELU())
         self.fpn_smooth2 = nn.Sequential(nn.Conv2d(fpn_dim, fpn_dim, 3, padding=1, bias=False), nn.BatchNorm2d(fpn_dim), nn.GELU())
 
-        # 3. Learnable SAM 2 Mask-Query Tokens (filament spine/barb queries vs sunspot/limb distractors)
+        # 3. Random normalized anchors plus learned foreground/background queries
         gen = torch.Generator().manual_seed(42)
         fg_init = F.normalize(torch.randn(num_queries, fpn_dim, generator=gen), dim=-1)
         bg_init = F.normalize(torch.randn(num_queries, fpn_dim, generator=gen), dim=-1)
@@ -683,84 +732,85 @@ class VLMSemanticBridge(nn.Module):
         self.logit_scale = nn.Parameter(torch.tensor(np.log(10.0), dtype=torch.float32))
 
     @torch.no_grad()
-    def _copy_matching_tensors(self, src_sd, source_label):
-        """Copies shape- and suffix-matched tensors from a pretrained state_dict into self."""
-        if isinstance(src_sd, dict) and 'model' in src_sd and isinstance(src_sd['model'], dict):
-            src_sd = src_sd['model']
-        elif isinstance(src_sd, dict) and 'state_dict' in src_sd and isinstance(src_sd['state_dict'], dict):
-            src_sd = src_sd['state_dict']
-        dst_sd = self.state_dict()
-        used_src = set()
-        matched = 0
-        for k_dst, v_dst in dst_sd.items():
-            for k_src, v_src in src_sd.items():
-                if k_src in used_src or not isinstance(v_src, torch.Tensor):
-                    continue
-                if v_src.shape == v_dst.shape and k_dst.split('.')[-1] == k_src.split('.')[-1]:
-                    v_dst.copy_(v_src.to(v_dst.device, dtype=v_dst.dtype))
-                    used_src.add(k_src)
-                    matched += 1
-                    break
-        if matched > 0:
-            print(f"✓ Preloaded SAM 2 Hiera ({source_label}) into VLMSemanticBridge ({matched} tensors)")
-        return matched > 0
+    def _copy_matching_tensors(self, src_sd, source_label, mapping=None):
+        """Load a native bridge strictly, or an explicitly reviewed key mapping.
+
+        Equal shapes alone never authorize a pretrained transfer. This custom
+        bridge is SAM-inspired; it is neither SAM 2's trunk nor a text encoder.
+        """
+        if not isinstance(src_sd, dict):
+            raise ValueError('Expected a state dictionary')
+        for key in ('model', 'state_dict'):
+            if key in src_sd and isinstance(src_sd[key], dict):
+                src_sd = src_sd[key]
+                break
+        dst = self.state_dict()
+        if mapping is None:
+            native = {k.removeprefix('module.').removeprefix('vlm_bridge.'): v
+                      for k, v in src_sd.items()
+                      if k.removeprefix('module.').startswith('vlm_bridge.')}
+            if native:
+                src_sd = native
+            if set(src_sd) != set(dst):
+                print(f'No verified native bridge mapping for {source_label}; '
+                      'keeping intentional initialization (0 pretrained parameters).')
+                return False
+            mapping = {key: key for key in dst}
+        if not isinstance(mapping, dict) or not mapping or len(set(mapping.values())) != len(mapping):
+            raise ValueError('Pretrained mapping must be nonempty destination -> unique source keys')
+        # Validate ALL mappings before mutating any weights.
+        for target, source in mapping.items():
+            if target not in dst or source not in src_sd:
+                raise ValueError(f'Unknown pretrained key mapping: {target} <- {source}')
+            value = src_sd[source]
+            if not isinstance(value, torch.Tensor) or value.shape != dst[target].shape:
+                raise ValueError(f'Pretrained shape mismatch: {target} <- {source}')
+            if not torch.isfinite(value).all():
+                raise ValueError(f'Nonfinite pretrained tensor: {source}')
+        for target, source in mapping.items():
+            dst[target].copy_(src_sd[source].to(dst[target]))
+        parameters = dict(self.named_parameters())
+        loaded = sum(parameters[k].numel() for k in mapping if k in parameters)
+        total = sum(p.numel() for p in parameters.values())
+        self.preload_provenance = {
+            'source': str(source_label), 'mapping': mapping,
+            'parameter_count': loaded, 'parameter_coverage': loaded / total,
+            'missing_keys': sorted(set(dst) - set(mapping)),
+            'unused_source_keys': sorted(set(src_sd) - set(mapping.values())),
+        }
+        print(f'Loaded {len(mapping)} explicitly mapped bridge tensors; '
+              f'{loaded:,}/{total:,} parameters ({loaded / total:.2%}) from {source_label}')
+        return True
 
     @torch.no_grad()
-    def preload_sam2_hiera(self, model_name=Config.VLM_MODEL_NAME, device='cpu'):
-        """
-        Preloads matching pretrained SAM 2 Hiera weights from:
-        1. A direct checkpoint file (.pt / .pth / .bin / .safetensors) uploaded as a Kaggle Dataset
-        2. A local Kaggle Dataset directory or HuggingFace repo ID (`facebook/sam2-hiera-tiny` or `facebook/sam2-hiera-base-plus`)
-        3. `timm` (`sam2_hiera_tiny` / `sam2_hiera_base_plus`)
-        Falls back cleanly to initialized weights if offline with no dataset attached.
-        """
-        # 1. Direct checkpoint file (.pt / .pth / .bin) or directory containing a .pt/.pth file
-        if isinstance(model_name, str) and os.path.exists(model_name):
-            ckpt_file = None
-            if os.path.isfile(model_name):
-                ckpt_file = model_name
-            elif os.path.isdir(model_name):
-                candidates = (
-                    glob.glob(os.path.join(model_name, "*.pt"))
-                    + glob.glob(os.path.join(model_name, "*.pth"))
-                    + glob.glob(os.path.join(model_name, "*.bin"))
-                )
-                if candidates and not os.path.exists(os.path.join(model_name, "config.json")):
-                    ckpt_file = candidates[0]
-            if ckpt_file is not None:
-                try:
-                    raw_sd = torch.load(ckpt_file, map_location=device, weights_only=False)
-                    if self._copy_matching_tensors(raw_sd, ckpt_file):
-                        return True
-                except Exception as exc:
-                    print(f"SAM 2 checkpoint file load note ({ckpt_file}): {exc}")
-
-        # 2. HuggingFace repo ID or local HuggingFace Dataset directory (containing config.json + model.safetensors)
-        if HAS_TRANSFORMERS:
-            try:
-                hf_model = AutoModel.from_pretrained(model_name).to(device).eval()
-                loaded = self._copy_matching_tensors(hf_model.state_dict(), model_name)
-                del hf_model
-                if loaded:
-                    return True
-            except Exception as exc:
-                print(f"SAM 2 Hiera HF preload fallback (using initialized Hiera + FPN weights): {exc}")
-
-        # 3. timm fallback
-        if HAS_TIMM:
-            try:
-                timm_name = 'sam2_hiera_base_plus' if 'base' in str(model_name) else 'sam2_hiera_tiny'
-                backbone = timm.create_model(timm_name, pretrained=True, features_only=True).to(device).eval()
-                loaded = self._copy_matching_tensors(backbone.state_dict(), timm_name)
-                del backbone
-                if loaded:
-                    return True
-            except Exception:
-                pass
-        return False
-
-    # Alias kept for backward compatibility with main() / existing callers
-    preload_clip_anchors = preload_sam2_hiera
+    def preload_sam2_hiera(self, model_name=None, device='cpu'):
+        """Explicit optional initialization; no downloads or stale-file reuse by default."""
+        source = model_name or Config.PRETRAINED_SOURCE
+        if not source:
+            print('Custom visual bridge: intentional initialization; no pretrained/text claim.')
+            return False
+        mapping = None
+        if Config.PRETRAINED_MAP:
+            with open(Config.PRETRAINED_MAP) as handle:
+                mapping = json.load(handle)
+        if os.path.isfile(source):
+            if source.endswith('.safetensors'):
+                from safetensors.torch import load_file
+                state = load_file(source, device='cpu')
+            else:
+                state = torch.load(source, map_location='cpu', weights_only=True)
+            if isinstance(state, dict) and state.get('kind') == 'bridge':
+                state = state['state_dict']
+            return self._copy_matching_tensors(state, source, mapping)
+        if mapping is None:
+            raise ValueError('An external SAM/HF model requires V5_PRETRAINED_MAP; '
+                             'the custom bridge is not a compatible SAM 2 backbone.')
+        from transformers import AutoModel
+        backbone = AutoModel.from_pretrained(source).cpu().eval()
+        try:
+            return self._copy_matching_tensors(backbone.state_dict(), source, mapping)
+        finally:
+            del backbone
 
     def forward(self, b, x=None, e3=None):
         """
@@ -772,7 +822,8 @@ class VLMSemanticBridge(nn.Module):
             If e3 is provided: (e3_mod, b_mod, vlm_logits, gamma, beta)
             If e3 is None:     (b_mod, vlm_logits, gamma, beta)
         """
-        with torch.amp.autocast('cuda', enabled=False):
+        with torch.autocast(device_type=b.device.type, dtype=torch.float16,
+                            enabled=Config.BRIDGE_AMP and b.is_cuda):
             b = b.float()
             x = x.float() if x is not None else None
             e3 = e3.float() if e3 is not None else None
@@ -866,7 +917,7 @@ class CognitiveRefiner(nn.Module):
         self.bridge3 = nn.Conv2d(in_ch, in_ch, 3, dilation=8, padding=8, groups=in_ch)
         
         # Agent Reasoning Gate: uses magnetic map + VLM contrastive prior to decide WHERE to connect
-        # If magnetic flow and VLM filament semantics are strong between two fragments, connect them
+        # Learned visual-query features condition connections alongside the magnetic proxy.
         self.gate = nn.Sequential(
             nn.Conv2d(in_ch + 2, in_ch, 1),  # +1 magnetic map, +1 VLM semantic prior
             nn.Sigmoid()
@@ -1072,7 +1123,8 @@ class DiceBCELoss(nn.Module):
         progress = float(ep - 1) / float(self.lovasz_warmup_epochs - 1)
         return float(self.lovasz_max_weight * min(1.0, max(0.0, progress)))
 
-    def forward(self, logits, targets, spine_targets=None, vlm_logits=None, epoch=5):
+    def forward(self, logits, targets, spine_targets=None, vlm_logits=None, epoch=5,
+                return_parts=False):
         """
         Args:
             logits: Raw model output (before sigmoid) [B, 1, H, W]
@@ -1103,6 +1155,8 @@ class DiceBCELoss(nn.Module):
             focal_loss = (focal_weight_map * bce_per_pixel).mean()
 
             total_loss = self.dice_weight * dice_loss + self.focal_weight * focal_loss
+            zero = logits_f.new_zeros(())
+            lovasz_loss, skeleton_loss, vlm_loss = zero, zero, zero
 
             # 3. Lovasz-Hinge Loss in strict FP32 with linear warmup across epochs 1..5
             w_lovasz = self.get_lovasz_weight(epoch)
@@ -1114,7 +1168,8 @@ class DiceBCELoss(nn.Module):
             if spine_targets is not None and self.skel_weight > 0:
                 sflat = spine_targets.float().reshape(-1)
                 skel_recall = ((iflat * sflat).sum() + smooth) / (sflat.sum() + smooth)
-                total_loss = total_loss + self.skel_weight * (1.0 - skel_recall)
+                skeleton_loss = 1.0 - skel_recall
+                total_loss = total_loss + self.skel_weight * skeleton_loss
 
             # 5. Auxiliary SAM 2 Hiera Query Supervision
             if vlm_logits is not None and self.vlm_weight > 0:
@@ -1122,23 +1177,34 @@ class DiceBCELoss(nn.Module):
                 vlm_loss = self.bce_mean(vlm_logits.float(), vlm_target)
                 total_loss = total_loss + self.vlm_weight * vlm_loss
 
+        if return_parts:
+            return total_loss, {k: v.detach() for k, v in {
+                'dice': dice_loss, 'focal': focal_loss, 'lovasz': lovasz_loss,
+                'skeleton': skeleton_loss, 'bridge': vlm_loss,
+            }.items()}
         return total_loss
 
 # %% [code] {"execution":{"iopub.status.busy":"2026-10-17T10:17:42.470986Z","iopub.execute_input":"2026-10-17T10:17:42.471330Z","iopub.status.idle":"2026-10-17T10:17:42.487967Z","shell.execute_reply.started":"2026-10-17T10:17:42.471300Z","shell.execute_reply":"2026-10-17T10:17:42.487125Z"}}
 # CELL 7: Training and Validation Loops
 # Uses Automatic Mixed Precision (AMP) for:
-#   - 2x faster training on modern GPUs
-#   - 50% less VRAM usage (critical for 1024x1024 images)
+#   - FP16 execution where supported (measure actual throughput)
+#   - Reduced activation storage; the bridge stays FP32 by default
 # Gradient clipping prevents exploding gradients with BCE loss.
 
 def forward_model(model, images, return_aux=False):
     """
     Safe forward wrapper for nn.DataParallel:
     1. When batch_size < num_gpus (e.g., B=1 on the last validation batch or test inference),
-       runs directly on `model.module` (cuda:0) so DataParallel never invokes replica 1 with empty positional args `()`.
+       runs directly on the primary module.
     2. Even when B >= num_gpus, avoids passing keyword arguments (`**kwargs`) through DataParallel
        by temporarily toggling an attribute on the unwrapped module.
     """
+    if not model.training and Config.EVAL_SERIAL:
+        unwrapped = unwrap_model(model)
+        outputs = [unwrapped(chunk, return_aux=return_aux) for chunk in images.split(1)]
+        if return_aux:
+            return tuple(torch.cat([output[i] for output in outputs]) for i in range(2))
+        return torch.cat(outputs)
     if isinstance(model, nn.DataParallel):
         unwrapped = model.module
         if images.shape[0] < len(model.device_ids):
@@ -1152,79 +1218,211 @@ def forward_model(model, images, return_aux=False):
     return model(images, return_aux=return_aux)
 
 
+def synchronize_devices():
+    if str(Config.DEVICE).startswith('cuda'):
+        devices = list(range(torch.cuda.device_count())) if Config.USE_DP else [Config.GPU]
+        for device in devices:
+            torch.cuda.synchronize(device)
+
+
+def profile_mark(timings, name, started, step):
+    if Config.MODE == 'benchmark':
+        synchronize_devices()
+    now = time.perf_counter()
+    if Config.MODE == 'benchmark' and step >= Config.PROFILE_WARMUP:
+        timings[name].append(now - started)
+    return now
+
+
+def write_json(path, value):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + '.tmp')
+    temporary.write_text(json.dumps(value, indent=2, allow_nan=False))
+    os.replace(temporary, path)
+
+
+def atomic_torch_save(value, path):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + '.tmp')
+    torch.save(value, temporary)
+    os.replace(temporary, path)
+
+
+def finite_tensor(value, label):
+    if not torch.isfinite(value).all().item():
+        raise FloatingPointError(f'Nonfinite {label}; stop and inspect the recorded batch IDs')
+
+
+def install_diagnostic_hooks(model):
+    """Device-local boundaries; hooks replicate with DataParallel. Debug only."""
+    handles = []
+    if not Config.DEBUG_SYNC:
+        return handles
+    selected = ('vlm_bridge.stage', 'vlm_bridge.fpn_smooth', 'att1.', 'att2.', 'att3.')
+    for name, module in model.named_modules():
+        if not name.startswith(selected) or not isinstance(
+                module, (nn.Conv2d, nn.BatchNorm2d, nn.MultiheadAttention, nn.Sigmoid)):
+            continue
+
+        def before(layer, inputs, label=name):
+            tensor = inputs[0]
+            if tensor.is_cuda:
+                torch.cuda.synchronize(tensor.device)
+            print(f'DEBUG enter {label}: device={tensor.device}, dtype={tensor.dtype}, '
+                  f'shape={tuple(tensor.shape)}, stride={tensor.stride()}, '
+                  f'offset={tensor.storage_offset()}, ptr_mod16={tensor.data_ptr() % 16}', flush=True)
+            finite_tensor(tensor, f'{label} input')
+
+        def after(layer, inputs, outputs, label=name):
+            values = outputs if isinstance(outputs, tuple) else (outputs,)
+            for value in values:
+                if isinstance(value, torch.Tensor):
+                    if value.is_cuda:
+                        torch.cuda.synchronize(value.device)
+                    finite_tensor(value, f'{label} output')
+            print(f'DEBUG exit {label}', flush=True)
+
+        handles += [module.register_forward_pre_hook(before), module.register_forward_hook(after)]
+    return handles
+
+
+def unpack_batch(batch):
+    images, masks = batch[:2]
+    spines = batch[2] if len(batch) >= 3 else None
+    ids = list(batch[3]) if len(batch) >= 4 else ['unknown'] * len(images)
+    return images, masks, spines, ids
+
+
+def epoch_report(totals, count, started, timings, label):
+    if count == 0:
+        raise ValueError(f'{label} loader has no usable records')
+    result = {key: float(value.item() / count) for key, value in totals.items()}
+    if not all(np.isfinite(value) for value in result.values()):
+        raise FloatingPointError(f'Nonfinite {label} epoch totals: {result}')
+    result['records'] = count
+    result['seconds'] = time.perf_counter() - started
+    if str(Config.DEVICE).startswith('cuda'):
+        result['memory'] = {
+            str(i): {'allocated_peak_mib': torch.cuda.max_memory_allocated(i) / 2**20,
+                     'reserved_peak_mib': torch.cuda.max_memory_reserved(i) / 2**20}
+            for i in (range(torch.cuda.device_count()) if Config.USE_DP else [Config.GPU])}
+    if timings:
+        result['timings_seconds'] = {
+            key: {'median': float(np.median(values)), 'p95': float(np.percentile(values, 95))}
+            for key, values in timings.items() if values}
+        batches = [sum(values) for values in zip(*timings.values())]
+        if batches:
+            result['timings_seconds']['batch'] = {
+                'median': float(np.median(batches)), 'p95': float(np.percentile(batches, 95))}
+    print(f'{label}: {json.dumps(result)}', flush=True)
+    return result
+
+
 def train_epoch(model, loader, optimizer, criterion, scaler, epoch=1):
-    """Train for one epoch. Returns average loss."""
     model.train()
-    epoch_loss = torch.zeros(1, device=Config.DEVICE, dtype=torch.float32)
-    
+    totals, timings = {}, defaultdict(list)
+    count = 0
     optimizer.zero_grad(set_to_none=True)
     remainder = len(loader) % Config.ACCUM_STEPS
-
-    for step, batch in enumerate(tqdm(loader, desc=f"Training (Ep {epoch})")):
-        if len(batch) == 3:
-            images, masks, spines = batch
-            spines = spines.to(Config.DEVICE, non_blocking=True)
-        else:
-            images, masks = batch
-            spines = None
+    if Config.MODE == 'benchmark':
+        synchronize_devices()
+    started = tick = time.perf_counter()
+    for step, batch in enumerate(tqdm(loader, desc=f'Training (Ep {epoch})',
+                                      mininterval=Config.PROGRESS_SECONDS)):
+        tick = profile_mark(timings, 'data_wait', tick, step)
+        images, masks, spines, ids = unpack_batch(batch)
+        if Config.DEBUG_SYNC:
+            print(f'TRAIN epoch={epoch} step={step} records={ids}', flush=True)
         images = images.to(Config.DEVICE, non_blocking=True)
         masks = masks.to(Config.DEVICE, non_blocking=True)
-
-        # Do not underweight a final, incomplete accumulation group.
-        accumulation_divisor = (
-            remainder
-            if remainder and step >= len(loader) - remainder
-            else Config.ACCUM_STEPS
-        )
-        
-        # Mixed precision forward pass (DataParallel-safe for any batch size)
-        with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=Config.DEVICE == 'cuda'):
-            logits, vlm_logits = forward_model(model, images, return_aux=True)
-            loss = criterion(
-                logits, masks, spine_targets=spines, vlm_logits=vlm_logits, epoch=epoch
-            ) / accumulation_divisor
-        
-        # Scaled backward pass
-        scaler.scale(loss).backward()
-
+        spines = spines.to(Config.DEVICE, non_blocking=True) if spines is not None else None
+        tick = profile_mark(timings, 'transfer', tick, step)
+        divisor = remainder if remainder and step >= len(loader) - remainder else Config.ACCUM_STEPS
+        with torch.autocast(device_type=images.device.type, dtype=torch.float16,
+                            enabled=images.is_cuda):
+            logits, auxiliary = forward_model(model, images, return_aux=True)
+        tick = profile_mark(timings, 'forward', tick, step)
+        loss, parts = criterion(logits, masks, spine_targets=spines, vlm_logits=auxiliary,
+                                epoch=epoch, return_parts=True)
+        tick = profile_mark(timings, 'criterion', tick, step)
+        scaler.scale(loss / divisor).backward()
+        tick = profile_mark(timings, 'backward', tick, step)
         if (step + 1) % Config.ACCUM_STEPS == 0 or step + 1 == len(loader):
-            # Gradient clipping (prevents exploding gradients)
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
+        tick = profile_mark(timings, 'optimizer', tick, step)
+        size = images.shape[0]
+        for key, value in {'loss': loss.detach(), **parts}.items():
+            totals[key] = totals.get(key, 0) + value.float() * size
+        count += size
+    return epoch_report(totals, count, started, timings, f'Train epoch {epoch}')
 
-        # Accumulate on GPU to avoid blocking host-device cudaStreamSynchronize every batch
-        epoch_loss += loss.detach().float() * accumulation_divisor
-    
-    return (epoch_loss / len(loader)).item()
 
+@torch.no_grad()
 def validate(model, loader, criterion, epoch=5):
-    """Validate model. Returns average loss."""
+    """Fixed full objective, record-weighted reporting, full batch semantics."""
     model.eval()
-    epoch_loss = torch.zeros(1, device=Config.DEVICE, dtype=torch.float32)
-    
-    with torch.no_grad():
-        for batch in tqdm(loader, desc="Validating"):
-            if len(batch) == 3:
-                images, masks, spines = batch
-                spines = spines.to(Config.DEVICE, non_blocking=True)
-            else:
-                images, masks = batch
-                spines = None
-            images = images.to(Config.DEVICE, non_blocking=True)
-            masks = masks.to(Config.DEVICE, non_blocking=True)
-            
-            with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=Config.DEVICE == 'cuda'):
-                logits, vlm_logits = forward_model(model, images, return_aux=True)
-                loss = criterion(
-                    logits, masks, spine_targets=spines, vlm_logits=vlm_logits, epoch=epoch
-                )
-            
-            epoch_loss += loss.detach().float()
-    
-    return (epoch_loss / len(loader)).item()
+    totals, timings, count = {}, defaultdict(list), 0
+    started = tick = time.perf_counter()
+    for step, batch in enumerate(tqdm(loader, desc='Validating',
+                                      mininterval=Config.PROGRESS_SECONDS)):
+        tick = profile_mark(timings, 'data_wait', tick, step)
+        images, masks, spines, ids = unpack_batch(batch)
+        if Config.MODE == 'diagnose':
+            print(f'VALIDATE epoch={epoch} step={step} records={ids}', flush=True)
+            if step < Config.CAPTURE_BATCHES:
+                atomic_torch_save({'images': images.cpu(), 'masks': masks.cpu(),
+                                   'spines': spines.cpu() if spines is not None else None,
+                                   'ids': ids, 'epoch': epoch},
+                                  Path(Config.OUT_DIR) / f'diagnostic_batch_{step}.pth')
+        images = images.to(Config.DEVICE, non_blocking=True)
+        masks = masks.to(Config.DEVICE, non_blocking=True)
+        spines = spines.to(Config.DEVICE, non_blocking=True) if spines is not None else None
+        tick = profile_mark(timings, 'transfer', tick, step)
+        with torch.autocast(device_type=images.device.type, dtype=torch.float16,
+                            enabled=images.is_cuda and Config.EVAL_AMP):
+            logits, auxiliary = forward_model(model, images, return_aux=True)
+        tick = profile_mark(timings, 'forward', tick, step)
+        # Always the same objective for best-checkpoint selection, including Ep 1.
+        loss, parts = criterion(logits, masks, spine_targets=spines, vlm_logits=auxiliary,
+                                epoch=Config.VAL_LOSS_EPOCH, return_parts=True)
+        tick = profile_mark(timings, 'criterion', tick, step)
+        size = len(images)
+        for key, value in {'loss': loss.detach(), **parts}.items():
+            totals[key] = totals.get(key, 0) + value.float() * size
+        count += size
+    return epoch_report(totals, count, started, timings, 'Validation (fixed objective)')
+
+
+@torch.no_grad()
+def preflight(model, loader):
+    """Check real batch 2 + singleton and auxiliary/plain routes before training."""
+    rng = capture_rng()
+    was_training = model.training
+    try:
+        model.eval()
+        batch = next(iter(loader))
+        images, _, _, ids = unpack_batch(batch)
+        images = images.to(Config.DEVICE)
+        with torch.autocast(device_type=images.device.type, dtype=torch.float16,
+                            enabled=images.is_cuda and Config.EVAL_AMP):
+            logits, auxiliary = forward_model(model, images, return_aux=True)
+            plain = forward_model(model, images)
+            single = forward_model(model, images[:1])
+        for name, tensor in [('logits', logits), ('auxiliary', auxiliary), ('singleton', single)]:
+            finite_tensor(tensor, name)
+        torch.testing.assert_close(logits, plain, rtol=2e-3, atol=2e-3)
+        torch.testing.assert_close(logits[:1], single, rtol=3e-2, atol=3e-2)
+        print(f'PREFLIGHT PASS: batch={len(images)}, singleton, auxiliary/plain; records={ids}')
+    finally:
+        model.train(was_training)
+        restore_rng(rng)
+
 
 # %% [code] {"execution":{"iopub.status.busy":"2026-10-17T10:17:42.489156Z","iopub.execute_input":"2026-10-17T10:17:42.489499Z","iopub.status.idle":"2026-10-17T10:17:42.510437Z","shell.execute_reply.started":"2026-10-17T10:17:42.489473Z","shell.execute_reply":"2026-10-17T10:17:42.509794Z"}}
 # CELL 8: Inference and Kaggle Submission Generator
@@ -1265,7 +1463,7 @@ def build_gaussian_window(size=Config.IMG_SIZE, sigma=Config.GAUSSIAN_SIGMA, dev
 
 def _predict_single_view(model, tensor, use_tta=False):
     """Predicts a probability map for a [B, 3, H, W] tensor with optional 4-fold TTA (DataParallel-safe)."""
-    with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=Config.DEVICE == 'cuda'):
+    with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=str(Config.DEVICE).startswith('cuda') and Config.EVAL_AMP):
         p0 = torch.sigmoid(forward_model(model, tensor, return_aux=False).float())
         if not use_tta:
             return p0
@@ -1341,257 +1539,481 @@ def predict_probability(model, tensor, use_tta=Config.USE_TTA):
 
     p_local = accum_prob / accum_weight.clamp_min(1e-6)
 
-    # 3. Anti-Breakage Soft-Gated High-Resolution Fusion
+    # 3. Hard global cutoff and weighted high-resolution fusion (preserved)
     gate_thresh = getattr(Config, 'GLOBAL_GATE_THRESH', 0.05)
     w_local = getattr(Config, 'LOCAL_BLEND_WEIGHT', 0.85)
     w_global = getattr(Config, 'GLOBAL_BLEND_WEIGHT', 0.15)
     p_final = (p_global > gate_thresh).float() * (w_local * p_local + w_global * p_global)
     return p_final
 
-def generate_submission(model, test_paths, out_path):
-    """
-    Generate Kaggle submission CSV from trained model.
-    
-    Args:
-        model: Trained MagAgentU2Net model
-        test_paths: List of test image file paths
-        out_path: Output path for submission.csv
-    """
+def postprocess_probability(probability):
+    """Shared native postprocessing for holdout and submission."""
+    array = probability.detach().float().cpu().numpy().squeeze()
+    if array.ndim != 2 or not np.isfinite(array).all() or array.min() < 0 or array.max() > 1.00001:
+        raise ValueError('Invalid native probability map')
+    mask = (array > Config.THRESHOLD).astype(np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    components = [(labels == i).astype(np.uint8) for i in range(1, count)
+                  if stats[i, cv2.CC_STAT_AREA] >= Config.MIN_AREA]
+    return components
+
+
+def pq_metrics(predictions, targets):
+    # Reused from V4's matching routine; IoU > 0.5 and disjoint predictions make
+    # accepted matches unique. Counts are diagnostics, not the official evaluator.
+    overlaps = np.zeros((len(predictions), len(targets)), dtype=np.float32)
+    for p, prediction in enumerate(predictions):
+        for t, target in enumerate(targets):
+            union = np.logical_or(prediction, target).sum()
+            overlaps[p, t] = np.logical_and(prediction, target).sum() / max(union, 1)
+    candidates = sorted(((overlaps[p, t], p, t) for p in range(len(predictions))
+                         for t in range(len(targets))), reverse=True)
+    matched_predictions, matched_targets, matched_iou = set(), set(), []
+    for iou, p, t in candidates:
+        if iou <= Config.PQ_IOU_THRESHOLD or p in matched_predictions or t in matched_targets:
+            continue
+        matched_predictions.add(p)
+        matched_targets.add(t)
+        matched_iou.append(float(iou))
+    tp = len(matched_iou)
+    fp, fn = len(predictions) - tp, len(targets) - tp
+    denominator = tp + 0.5 * fp + 0.5 * fn
+    # A 0.1 IoU diagnostic threshold avoids counting a one-pixel touch as a split.
+    touching = overlaps > 0.1
+    return {'pq': sum(matched_iou) / denominator if denominator else 0.0,
+            'sum_iou': sum(matched_iou), 'tp': tp, 'fp': fp, 'fn': fn,
+            'splits': int(np.maximum(touching.sum(axis=0) - 1, 0).sum()),
+            'merges': int(np.maximum(touching.sum(axis=1) - 1, 0).sum())}
+
+
+@torch.no_grad()
+def evaluate_native(model, coco, validation_ids, limit=0):
+    """Predict once/file; score each annotation record separately, then file-macro."""
     model.eval()
-    submissions = []
-    close_kernel = np.ones((3, 3), dtype=np.uint8)
-    
+    grouped = defaultdict(list)
+    for image_id in validation_ids:
+        grouped[coco.imgs[image_id]['file_name']].append(image_id)
+    records, file_scores = [], []
+    started = time.perf_counter()
+    items = list(grouped.items())
+    if limit:
+        items = items[:limit]
+    for filename, ids in tqdm(items, desc='Native holdout', mininterval=Config.PROGRESS_SECONDS):
+        image = load_image(str(Path(Config.TRAIN_DIR) / filename))
+        prepared, _ = prepare_input_3ch(image)
+        tensor = torch.from_numpy(prepared).permute(2, 0, 1).unsqueeze(0).to(Config.DEVICE)
+        probability = predict_probability(model, tensor, use_tta=Config.USE_TTA)
+        predictions = postprocess_probability(probability)
+        binary = np.zeros(image.shape, dtype=np.uint8)
+        for prediction in predictions:
+            binary |= prediction
+        current = []
+        for image_id in ids:
+            targets = [coco.annToMask(ann).astype(bool) for ann in coco.imgToAnns.get(image_id, [])]
+            target = np.zeros(image.shape, dtype=bool)
+            for instance in targets:
+                target |= instance
+            denominator = int(binary.sum() + target.sum())
+            dice = 2 * np.logical_and(binary, target).sum() / denominator if denominator else 1.0
+            metrics = {'image_id': str(image_id), 'file_name': filename,
+                       'dice': float(dice), **pq_metrics(predictions, targets)}
+            records.append(metrics)
+            current.append(metrics)
+        file_scores.append({key: float(np.mean([r[key] for r in current])) for key in ('dice', 'pq')})
+    if not records:
+        raise ValueError('No native validation records')
+    totals = {key: sum(r[key] for r in records) for key in ('sum_iou', 'tp', 'fp', 'fn', 'splits', 'merges')}
+    denominator = totals['tp'] + 0.5 * totals['fp'] + 0.5 * totals['fn']
+    result = {'policy': 'each annotation record scored independently; equal weight per physical file',
+              'metric_note': 'local PQ diagnostic (IoU > 0.5), not a verified competition score',
+              'physical_files': len(items), 'annotation_records': len(records),
+              'dice_file_macro': float(np.mean([r['dice'] for r in file_scores])),
+              'pq_file_macro': float(np.mean([r['pq'] for r in file_scores])),
+              'pq_record_micro': totals['sum_iou'] / denominator if denominator else 0.0,
+              'totals': totals, 'seconds': time.perf_counter() - started,
+              'threshold': Config.THRESHOLD, 'min_area': Config.MIN_AREA,
+              'global_cutoff': Config.GLOBAL_GATE_THRESH, 'tta': Config.USE_TTA,
+              'records': records}
+    write_json(Path(Config.OUT_DIR) / 'native_validation.json', result)
+    print(f'Native holdout: Dice={result["dice_file_macro"]:.4f}, '
+          f'local PQ={result["pq_file_macro"]:.4f}; {len(items)} files, '
+          f'{result["seconds"]:.1f}s. Per-record details saved.')
+    return result
+
+
+def generate_submission(model, test_paths, out_path):
+    """Use exactly the native holdout decoder; validate every exported COCO RLE."""
+    model.eval()
+    submissions, empty_images = [], []
+    stems = [Path(path).stem for path in test_paths]
+    if len(stems) != len(set(stems)):
+        raise ValueError('Duplicate input filenames would produce duplicate filament IDs')
+    started = time.perf_counter()
     with torch.no_grad():
-        for img_path in tqdm(test_paths, desc="Generating Submission"):
-            # Extract image ID from filename (e.g., "20220621185332Bh")
-            base_id = os.path.basename(img_path).split('.')[0]
-            
-            # Load and preprocess
-            img = load_image(img_path)
-            if img is None:
-                img = np.random.randint(0, 65535, (2048, 2048), dtype=np.uint16)
-            
-            # Create native 2048x2048 3-channel input for 3x3 Gaussian-stitched + global gated inference
-            img_3ch, _ = prepare_input_3ch(img)
-            
-            # Convert native 2048x2048 image to tensor and predict with Gated Gaussian Stitching
-            tensor_2048 = torch.tensor(img_3ch).permute(2, 0, 1).unsqueeze(0).to(
-                Config.DEVICE, non_blocking=True
-            )
-            
-            prob_2048 = predict_probability(model, tensor_2048, use_tta=Config.USE_TTA)
-            pred_mask_2048 = (prob_2048 > Config.THRESHOLD).cpu().numpy().squeeze().astype(np.uint8)
-            pred_mask_2048 = cv2.morphologyEx(pred_mask_2048, cv2.MORPH_CLOSE, close_kernel)
-            
-            # Connected Components: separate individual filaments
-            # This is CRITICAL for Panoptic Quality (avoids over-merging)
-            num_labels, labels_im = cv2.connectedComponents(pred_mask_2048)
-            
-            for i in range(1, num_labels):  # Skip 0 (background)
-                component_mask = (labels_im == i).astype(np.uint8)
-                
-                # Filter out tiny noise fragments
-                # This improves PQ by reducing false positives
-                if component_mask.sum() < Config.MIN_AREA:
-                    continue
-                
-                # Encode to RLE format required by competition
-                rle_str = pycoco_rle_encode(component_mask)
-                fil_id = f"{base_id}_{i}"
-                submissions.append({
-                    'filament_id': fil_id,
-                    'segmentation_rle': rle_str
-                })
-    
-    # Save submission CSV
-    df = pd.DataFrame(submissions, columns=['filament_id', 'segmentation_rle'])
-    df.to_csv(out_path, index=False)
-    print(f"\nSubmission saved to {out_path}")
-    print(f"Total filaments detected: {len(df)}")
-    if not df.empty:
-        print(f"Unique images: {df['filament_id'].str.rsplit('_', n=1).str[0].nunique()}")
+        for img_path in tqdm(test_paths, desc='Generating Submission', mininterval=Config.PROGRESS_SECONDS):
+            image = load_image(img_path)
+            prepared, _ = prepare_input_3ch(image)
+            tensor = torch.from_numpy(prepared).permute(2, 0, 1).unsqueeze(0).to(Config.DEVICE)
+            probability = predict_probability(model, tensor, use_tta=Config.USE_TTA)
+            if tuple(probability.shape[-2:]) != image.shape:
+                raise ValueError(f'Output dimensions do not match {img_path}: {probability.shape}')
+            components = postprocess_probability(probability)
+            if not components:
+                empty_images.append(Path(img_path).stem)
+            for i, component in enumerate(components, 1):
+                rle = pycoco_rle_encode(component)
+                decoded = maskUtils.decode({'size': list(component.shape), 'counts': rle.encode('utf-8')})
+                if not np.array_equal(decoded, component):
+                    raise ValueError(f'RLE round-trip failed for {img_path}, instance {i}')
+                submissions.append({'filament_id': f'{Path(img_path).stem}_{i}', 'segmentation_rle': rle})
+    frame = pd.DataFrame(submissions, columns=['filament_id', 'segmentation_rle'])
+    if frame['filament_id'].duplicated().any():
+        raise ValueError('Duplicate submission filament IDs')
+    temporary = str(out_path) + '.tmp'
+    frame.to_csv(temporary, index=False)
+    os.replace(temporary, out_path)
+    result = {'input_images': len(test_paths), 'images_with_components': len(test_paths) - len(empty_images),
+              'empty_image_ids': empty_images, 'filaments': len(frame),
+              'seconds': time.perf_counter() - started, 'rle_roundtrip_verified': True,
+              'schema': list(frame.columns)}
+    write_json(str(out_path) + '.audit.json', result)
+    print(f'SUBMISSION VERIFIED: {out_path}; {json.dumps(result)}')
 
-# %% [code] {"execution":{"iopub.status.busy":"2026-10-17T10:17:42.512338Z","iopub.execute_input":"2026-10-17T10:17:42.512631Z","iopub.status.idle":"2026-10-17T10:17:48.428416Z","shell.execute_reply.started":"2026-10-17T10:17:42.512613Z","shell.execute_reply":"2026-10-17T10:17:48.427243Z"}}
-# CELL 9: Main Execution Pipeline
-# This cell orchestrates the entire workflow:
-# 1. Load COCO annotations JSON
-# 2. Split images into train (80%) and validation (20%)
-# 3. Create DataLoaders with augmentations
-# 4. Initialize Mag-Agent U²-Net model + Preload VLM (`best_vlm.pth`)
-# 5. Train with early stopping (save `best_model.pth` and `best_vlm.pth`)
-# 6. Load best model + best VLM and generate Kaggle submission
-
-# CELL 9: Main Execution Pipeline (FIXED FOR STRING IDs)
-# FIX: Extracts string IDs directly from coco.imgs.keys() instead of getImgIds()
 
 def seed_everything(seed=Config.SEED):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
+        torch.cuda.set_device(Config.GPU)
         torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.benchmark = False
-        if hasattr(torch.backends.cuda, "enable_flash_sdp"):
-            torch.backends.cuda.enable_flash_sdp(False)
-        if hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
-            torch.backends.cuda.enable_mem_efficient_sdp(False)
-        if hasattr(torch.backends.cuda, "enable_cudnn_sdp"):
-            torch.backends.cuda.enable_cudnn_sdp(False)
-        if hasattr(torch.backends.cuda, "enable_math_sdp"):
-            torch.backends.cuda.enable_math_sdp(True)
+    torch.backends.mha.set_fastpath_enabled(Config.MHA_FASTPATH)
+    torch.backends.cudnn.enabled = Config.CUDNN
+    torch.backends.cudnn.benchmark = Config.CUDNN_BENCHMARK
+    if Config.SDP_BACKEND not in {'math', 'auto', 'efficient', 'flash', 'cudnn'}:
+        raise ValueError(f'Unknown V5_SDP={Config.SDP_BACKEND}')
+    for name, selected in [('flash', 'flash'), ('mem_efficient', 'efficient'),
+                           ('cudnn', 'cudnn'), ('math', 'math')]:
+        setter = getattr(torch.backends.cuda, f'enable_{name}_sdp', None)
+        if setter:
+            setter(Config.SDP_BACKEND in {'auto', selected})
 
-def save_v5_checkpoints(model, model_path, vlm_path):
-    """Save segmentation weights to best_model.pth and VLM weights to best_vlm.pth."""
-    unwrapped = model.module if isinstance(model, nn.DataParallel) else model
-    seg_state = {k: v for k, v in unwrapped.state_dict().items() if not k.startswith("vlm_bridge.")}
-    torch.save(seg_state, model_path)
-    torch.save(unwrapped.vlm_bridge.state_dict(), vlm_path)
 
-def load_v5_checkpoints(model, model_path, vlm_path, device):
-    """Load segmentation weights from best_model.pth and VLM weights from best_vlm.pth."""
-    unwrapped = model.module if isinstance(model, nn.DataParallel) else model
-    unwrapped.load_state_dict(
-        torch.load(model_path, map_location=device, weights_only=True), strict=False
-    )
-    if os.path.exists(vlm_path):
-        unwrapped.vlm_bridge.load_state_dict(
-            torch.load(vlm_path, map_location=device, weights_only=True)
-        )
+def capture_rng():
+    numpy_state = np.random.get_state()
+    return {'python': random.getstate(),
+            'numpy': [numpy_state[0], numpy_state[1].tolist(), *numpy_state[2:]],
+            'torch': torch.get_rng_state(),
+            'cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []}
+
+
+def restore_rng(state):
+    random.setstate(state['python'])
+    algorithm, keys, position, gaussian, cached = state['numpy']
+    np.random.set_state((algorithm, np.asarray(keys, dtype=np.uint32), position, gaussian, cached))
+    torch.set_rng_state(state['torch'].cpu())
+    if torch.cuda.is_available() and state['cuda']:
+        if len(state['cuda']) != torch.cuda.device_count():
+            raise ValueError('Resume GPU count differs; RNG replay would be invalid')
+        torch.cuda.set_rng_state_all([item.cpu() for item in state['cuda']])
+
+
+def unwrap_model(model):
+    return model.module if isinstance(model, nn.DataParallel) else model
+
+
+def model_signature(model):
+    schema = [(name, list(value.shape), str(value.dtype))
+              for name, value in unwrap_model(model).state_dict().items()]
+    return hashlib.sha256(json.dumps(schema).encode()).hexdigest()
+
+
+def experiment_config():
+    names = ('IMG_SIZE', 'ORIGINAL_SIZE', 'BATCH_SIZE', 'ACCUM_STEPS', 'EPOCHS', 'LR',
+             'WEIGHT_DECAY', 'IN_CHANNELS', 'OUT_CHANNELS', 'SEED', 'SAM2_VARIANT',
+             'CROP_PROB', 'FILAMENT_CENTER_PROB', 'CROP_JITTER', 'DICE_WEIGHT',
+             'FOCAL_WEIGHT', 'FOCAL_ALPHA', 'FOCAL_GAMMA', 'LOVASZ_MAX_WEIGHT',
+             'LOVASZ_WARMUP_EPOCHS', 'SKEL_RECALL_WEIGHT', 'VLM_PRIOR_WEIGHT', 'VAL_LOSS_EPOCH')
+    return {name: getattr(Config, name) for name in names}
+
+
+def runtime_manifest(model, train_ids, val_ids, coco):
+    runtime = {name: getattr(Config, name) for name in vars(Config)
+               if name.isupper() and isinstance(getattr(Config, name), (str, bool, int, float))}
+    fingerprint_kind = 'file'
+    if '__file__' in globals() and Path(__file__).is_file():
+        source = Path(__file__).read_bytes()
+    else:
+        try:
+            source = (inspect.getsource(MagAgentU2Net) + inspect.getsource(VLMSemanticBridge)).encode()
+            fingerprint_kind = 'model_definitions'
+        except (OSError, TypeError):
+            source = model_signature(model).encode()
+            fingerprint_kind = 'schema_only_source_unavailable'
+    annotation_hash = hashlib.sha256(Path(Config.ANNOTATIONS_FILE).read_bytes()).hexdigest()
+    split = {'train': [str(i) for i in train_ids], 'validation': [str(i) for i in val_ids],
+             'files': {str(i): coco.imgs[i]['file_name'] for i in train_ids + val_ids}}
+    split_hash = hashlib.sha256(json.dumps(split, sort_keys=True).encode()).hexdigest()
+    try:
+        driver = subprocess.run(['nvidia-smi', '--query-gpu=index,name,driver_version',
+                                 '--format=csv,noheader'], capture_output=True, text=True,
+                                timeout=10, check=False).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        driver = 'not available'
+    return {'run_id': uuid.uuid4().hex, 'source_sha256': hashlib.sha256(source).hexdigest(),
+            'source_fingerprint_kind': fingerprint_kind,
+            'model_signature': model_signature(model), 'experiment': experiment_config(),
+            'annotation_sha256': annotation_hash, 'split_sha256': split_hash,
+            'runtime': runtime, 'python': platform.python_version(),
+            'packages': {'torch': str(torch.__version__), 'numpy': np.__version__,
+                         'opencv': cv2.__version__, 'albumentations': A.__version__,
+                         'pandas': pd.__version__},
+            'cuda': torch.version.cuda, 'cudnn': torch.backends.cudnn.version(),
+            'driver': driver, 'cuda_launch_blocking': os.getenv('CUDA_LAUNCH_BLOCKING', '0'),
+            'gpus': [{'index': i, 'name': torch.cuda.get_device_name(i),
+                      'capability': list(torch.cuda.get_device_capability(i)),
+                      'memory_bytes': torch.cuda.get_device_properties(i).total_memory}
+                     for i in range(torch.cuda.device_count())],
+            'preload': getattr(unwrap_model(model).vlm_bridge, 'preload_provenance',
+                               {'source': 'intentional initialization', 'parameter_coverage': 0.0}),
+            'split': split}
+
+
+def check_checkpoint(checkpoint, model, expected=None):
+    if checkpoint.get('format_version') != 2 or 'metadata' not in checkpoint:
+        raise ValueError('Legacy/unverified checkpoint: use explicit pretrained transfer; not resume/inference')
+    metadata = checkpoint['metadata']
+    if metadata.get('model_signature') != model_signature(model):
+        raise ValueError('Checkpoint architecture/schema mismatch')
+    if expected:
+        for key in ('experiment', 'split_sha256', 'annotation_sha256'):
+            if metadata.get(key) != expected.get(key):
+                raise ValueError(f'Checkpoint {key} mismatch; use its original config/split')
+    return metadata
+
+
+def cpu_state(model):
+    return {key: value.detach().cpu().clone() for key, value in unwrap_model(model).state_dict().items()}
+
+
+def save_v5_checkpoints(model, model_path, vlm_path=None, metadata=None):
+    """best_model is a single authoritative, complete model (bridge included)."""
+    metadata = dict(metadata or {})
+    metadata.update(model_signature=model_signature(model), checkpoint_id=uuid.uuid4().hex)
+    state = cpu_state(model)
+    atomic_torch_save({'format_version': 2, 'kind': 'inference',
+                       'metadata': metadata, 'model': state}, model_path)
+    if vlm_path:
+        bridge = {key.removeprefix('vlm_bridge.'): value for key, value in state.items()
+                  if key.startswith('vlm_bridge.')}
+        atomic_torch_save({'format_version': 2, 'kind': 'bridge', 'metadata': metadata,
+                           'state_dict': bridge}, vlm_path)
+
+
+def load_v5_checkpoints(model, model_path, vlm_path=None, device='cpu', expected=None):
+    checkpoint = torch.load(model_path, map_location='cpu', weights_only=True)
+    metadata = check_checkpoint(checkpoint, model, expected)
+    if checkpoint.get('kind') not in {'inference', 'training'}:
+        raise ValueError('Expected a complete model checkpoint')
+    if vlm_path is not None:
+        bridge = torch.load(vlm_path, map_location='cpu', weights_only=True)
+        if bridge.get('kind') != 'bridge' or bridge.get('metadata', {}).get('checkpoint_id') != metadata.get('checkpoint_id'):
+            raise ValueError('Mismatched model/bridge checkpoint pair')
+        saved_bridge = {key.removeprefix('vlm_bridge.'): value for key, value in checkpoint['model'].items()
+                        if key.startswith('vlm_bridge.')}
+        if set(bridge['state_dict']) != set(saved_bridge) or any(
+                not torch.equal(value, bridge['state_dict'][key]) for key, value in saved_bridge.items()):
+            raise ValueError('Bridge export contents do not match the full model')
+    unwrap_model(model).load_state_dict(checkpoint['model'], strict=True)
+    return metadata
+
+
+def save_training_checkpoint(path, model, optimizer, scaler, scheduler, metadata,
+                             epoch, phase, best_loss, train_report, best_model_state=None):
+    atomic_torch_save({'format_version': 2, 'kind': 'training', 'metadata': metadata,
+                       'model': cpu_state(model), 'optimizer': optimizer.state_dict(),
+                       'scaler': scaler.state_dict(), 'scheduler': scheduler.state_dict(),
+                       'epoch': epoch, 'phase': phase, 'best_loss': best_loss,
+                       'train_report': train_report, 'rng': capture_rng(),
+                       'best_model': best_model_state}, path)
+
+
+def make_loader(dataset, training):
+    generator = torch.Generator().manual_seed(Config.SEED)
+    return DataLoader(dataset, batch_size=Config.BATCH_SIZE, shuffle=training,
+                      drop_last=training, num_workers=Config.NUM_WORKERS,
+                      pin_memory=str(Config.DEVICE).startswith('cuda'),
+                      persistent_workers=Config.PERSISTENT_WORKERS and Config.NUM_WORKERS > 0,
+                      generator=generator)
+
 
 def main():
-    seed_everything(Config.SEED)
+    if Config.MODE not in {'train', 'smoke', 'diagnose', 'benchmark', 'evaluate', 'submit'}:
+        raise ValueError(f'Unknown V5_MODE={Config.MODE}')
+    if Config.NUM_WORKERS < 0 or Config.VAL_CACHE_ITEMS < 0 or Config.PROFILE_BATCHES < 1 or Config.PROFILE_EPOCH < 1:
+        raise ValueError('Invalid worker/cache/profile configuration')
+    seed_everything()
     os.makedirs(Config.OUT_DIR, exist_ok=True)
-    # === 1. Load COCO Annotations ===
-    print("=" * 60)
-    print("Loading COCO annotations...")
+    # Smoke/benchmark artifacts cannot overwrite full training checkpoints.
+    if Config.MODE in {'smoke', 'benchmark', 'diagnose'}:
+        Config.OUT_DIR = str(Path(Config.OUT_DIR) / Config.MODE)
+        os.makedirs(Config.OUT_DIR, exist_ok=True)
     coco = COCO(Config.ANNOTATIONS_FILE)
-    
-    # FIX 3: Get string IDs directly from the imgs dictionary keys
-    all_img_ids = list(coco.imgs.keys())
-    print(f"Total images in JSON: {len(all_img_ids)}")
-    
-    # Filter to only images that actually exist on disk and group by physical file_name
-    valid_img_ids = []
-    file_to_ids = defaultdict(list)
-    for img_id in all_img_ids:
-        file_name = coco.imgs[img_id]['file_name']
-        img_path = os.path.join(Config.TRAIN_DIR, file_name)
-        if os.path.exists(img_path):
-            valid_img_ids.append(img_id)
-            file_to_ids[file_name].append(img_id)
-            
-    print(f"Found {len(valid_img_ids)} valid training records across {len(file_to_ids)} physical images.")
-    print(f"Total annotations: {len(coco.dataset.get('annotations', []))}")
-    print("=" * 60)
-    
-    # === 2. Group-Safe Train/Val Split (80/20 by physical file, keeping all annotation passes) ===
-    unique_files = sorted(file_to_ids.keys())
-    rng = random.Random(Config.SEED)
-    rng.shuffle(unique_files)
-    split_idx = int(0.8 * len(unique_files))
-    train_files = set(unique_files[:split_idx])
-    val_files = set(unique_files[split_idx:])
-    train_ids = [img_id for f in unique_files[:split_idx] for img_id in file_to_ids[f]]
-    val_ids = [img_id for f in unique_files[split_idx:] for img_id in file_to_ids[f]]
-    assert not (train_files & val_files), "Physical file leak detected between train and val!"
-    
-    print(f"Training records: {len(train_ids)} ({len(train_files)} physical images)")
-    print(f"Validation records: {len(val_ids)} ({len(val_files)} physical images)")
-    
-    # === 3. Create Datasets and DataLoaders ===
-    train_ds = SolarDataset(
-        coco, train_ids, Config.TRAIN_DIR, Config.IMG_SIZE, train_transforms,
-        return_spine=True, training=True
-    )
-    val_ds = SolarDataset(
-        coco, val_ids, Config.TRAIN_DIR, Config.IMG_SIZE, val_transforms,
-        return_spine=True, training=False
-    )
-    
-    train_loader = DataLoader(
-        train_ds, batch_size=Config.BATCH_SIZE, shuffle=True, drop_last=True,
-        num_workers=Config.NUM_WORKERS, pin_memory=True,
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size=Config.BATCH_SIZE, shuffle=False, drop_last=False,
-        num_workers=Config.NUM_WORKERS, pin_memory=True,
-    )
-    
-    # === 4. Initialize Model & Preload VLM Before Training ===
-    model = MagAgentU2Net(in_ch=Config.IN_CHANNELS, out_ch=Config.OUT_CHANNELS)
-    model_path = os.path.join(Config.OUT_DIR, Config.MODEL_WEIGHTS_NAME)
-    vlm_path = os.path.join(Config.OUT_DIR, Config.VLM_WEIGHTS_NAME)
-    if os.path.exists(vlm_path):
-        model.vlm_bridge.load_state_dict(torch.load(vlm_path, map_location='cpu', weights_only=True))
-        print(f"✓ Loaded existing VLM weights from {vlm_path}")
-    else:
-        model.vlm_bridge.preload_clip_anchors(Config.VLM_MODEL_NAME, device=Config.DEVICE)
-        torch.save(model.vlm_bridge.state_dict(), vlm_path)
-        print(f"✓ Saved initial VLM weights to {vlm_path}")
-
+    files = defaultdict(list)
+    for image_id, info in coco.imgs.items():
+        path = Path(Config.TRAIN_DIR) / info['file_name']
+        if not path.is_file():
+            raise FileNotFoundError(f'Missing annotated image: {path}')
+        files[info['file_name']].append(image_id)
+    filenames = sorted(files)
+    random.Random(Config.SEED).shuffle(filenames)
+    split = int(0.8 * len(filenames))
+    train_ids = [i for name in filenames[:split] for i in files[name]]
+    val_ids = [i for name in filenames[split:] for i in files[name]]
+    if not train_ids or not val_ids:
+        raise ValueError('Need nonempty physical-file train/validation splits')
+    assert not set(filenames[:split]) & set(filenames[split:])
+    print(f'Train: {len(train_ids)} records / {split} physical files; '
+          f'validation: {len(val_ids)} records / {len(filenames) - split} files')
+    full_train_ids, full_val_ids = list(train_ids), list(val_ids)
+    if Config.MODE == 'smoke':
+        train_ids, val_ids = train_ids[:4], val_ids[:3]
+    elif Config.MODE == 'benchmark':
+        limit = (Config.PROFILE_WARMUP + Config.PROFILE_BATCHES) * Config.BATCH_SIZE
+        train_ids, val_ids = train_ids[:limit], val_ids[:limit + 1]
+    train_ds = SolarDataset(coco, train_ids, Config.TRAIN_DIR, Config.IMG_SIZE,
+                            train_transforms, return_spine=True, training=True)
+    val_ds = SolarDataset(coco, val_ids, Config.TRAIN_DIR, Config.IMG_SIZE,
+                          val_transforms, return_spine=True)
+    train_loader, val_loader = make_loader(train_ds, True), make_loader(val_ds, False)
+    if len(train_loader) == 0:
+        raise ValueError('Training split has fewer records than BATCH_SIZE')
+    model = MagAgentU2Net(Config.IN_CHANNELS, Config.OUT_CHANNELS)
+    if not Config.RESUME_PATH and not Config.CHECKPOINT_PATH:
+        model.vlm_bridge.preload_sam2_hiera()
+    manifest = runtime_manifest(model, full_train_ids, full_val_ids, coco)
+    manifest['training_protocol'] = Config.MODE
+    manifest['selected_records'] = {'train': [str(i) for i in train_ids],
+                                    'validation': [str(i) for i in val_ids]}
     model = model.to(Config.DEVICE)
-    if torch.cuda.device_count() > 1:
-        print(f"Using {torch.cuda.device_count()} GPUs with DataParallel")
-        model = nn.DataParallel(model)
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=Config.LR, weight_decay=Config.WEIGHT_DECAY
-    )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=Config.EPOCHS, eta_min=1e-6)
+    if Config.USE_DP and torch.cuda.device_count() > 1:
+        devices = [Config.GPU] + [i for i in range(torch.cuda.device_count()) if i != Config.GPU]
+        model = nn.DataParallel(model, device_ids=devices, output_device=Config.GPU)
+    print(f'Parameters: {sum(p.numel() for p in model.parameters()):,}; '
+          f'device={Config.DEVICE}; DataParallel={isinstance(model, nn.DataParallel)}; '
+          f'MHA fastpath={Config.MHA_FASTPATH}; SDP={Config.SDP_BACKEND}; '
+          f'bridge AMP={Config.BRIDGE_AMP}; eval AMP={Config.EVAL_AMP}; '
+          f'eval serial={Config.EVAL_SERIAL}; effective batch={Config.BATCH_SIZE * Config.ACCUM_STEPS}')
+    write_json(Path(Config.OUT_DIR) / 'run_manifest.json', manifest)
+    handles = install_diagnostic_hooks(unwrap_model(model))
     criterion = DiceBCELoss()
-    scaler = torch.amp.GradScaler('cuda', enabled=Config.DEVICE == 'cuda')
-    
-    # Print model summary
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"\nModel Parameters: {total_params:,} total, {trainable_params:,} trainable")
-    print(f"Device: {Config.DEVICE}")
-    print(f"Image Size: {Config.IMG_SIZE}x{Config.IMG_SIZE}")
-    print(f"Loader Batch Size: {Config.BATCH_SIZE}")
-    print(f"Gradient Accumulation Steps: {Config.ACCUM_STEPS}")
-    print(f"Effective Batch Size: {Config.BATCH_SIZE * Config.ACCUM_STEPS}")
-    print("=" * 60)
-    
-    # === 5. Training Loop ===
-    best_loss = float('inf')
-    
-    for epoch in range(Config.EPOCHS):
-        print(f"\n{'='*40}")
-        print(f"Epoch {epoch+1}/{Config.EPOCHS}")
-        print(f"{'='*40}")
-        
-        train_loss = train_epoch(model, train_loader, optimizer, criterion, scaler, epoch=epoch + 1)
-        val_loss = validate(model, val_loader, criterion, epoch=epoch + 1)
-        scheduler.step()
-        
-        print(f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
-        
-        # Save best model & best VLM separately
-        if val_loss < best_loss:
-            best_loss = val_loss
-            save_v5_checkpoints(model, model_path, vlm_path)
-            print(f"✓ Saved new best model ({model_path}) and VLM ({vlm_path})! (val_loss: {val_loss:.4f})")
-    
-    # === 6. Generate Submission ===
-    print("\n" + "=" * 60)
-    print("Generating Kaggle submission...")
-    load_v5_checkpoints(model, model_path, vlm_path, Config.DEVICE)
-    
-    test_imgs = sorted(glob.glob(os.path.join(Config.TEST_DIR, '*.jpeg')))
-    print(f"Found {len(test_imgs)} test images.")
-    
-    submission_path = os.path.join(Config.OUT_DIR, 'submission.csv')
-    generate_submission(model, test_imgs, submission_path)
-    
-    print("\n" + "=" * 60)
-    print("PIPELINE COMPLETE!")
-    print(f"Submission file: {submission_path}")
-    print("=" * 60)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=Config.LR, weight_decay=Config.WEIGHT_DECAY)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=Config.EPOCHS, eta_min=1e-6)
+    scaler = torch.amp.GradScaler('cuda', enabled=str(Config.DEVICE).startswith('cuda'))
+    model_path = str(Path(Config.OUT_DIR) / Config.MODEL_WEIGHTS_NAME)
+    bridge_path = str(Path(Config.OUT_DIR) / Config.VLM_WEIGHTS_NAME)
+    last_path = str(Path(Config.OUT_DIR) / 'last_training.pth')
+    start_epoch, phase, best_loss, last_train = 1, 'ready', float('inf'), None
+    best_model_state = None
+    if Config.RESUME_PATH:
+        checkpoint = torch.load(Config.RESUME_PATH, map_location='cpu', weights_only=True)
+        saved = check_checkpoint(checkpoint, model, manifest)
+        if checkpoint.get('kind') != 'training' or checkpoint.get('phase') not in {'trained', 'validated'}:
+            raise ValueError('Resume requires a training checkpoint with an epoch phase')
+        if saved.get('training_protocol') != Config.MODE:
+            raise ValueError('Cannot resume a smoke/benchmark checkpoint as full training (or vice versa)')
+        unwrap_model(model).load_state_dict(checkpoint['model'], strict=True)
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        scaler.load_state_dict(checkpoint['scaler'])
+        scheduler.load_state_dict(checkpoint['scheduler'])
+        phase = checkpoint['phase']
+        start_epoch = checkpoint['epoch'] + (phase == 'validated')
+        best_loss, last_train = checkpoint['best_loss'], checkpoint['train_report']
+        best_model_state = checkpoint.get('best_model')
+        manifest['resumed_from'] = Config.RESUME_PATH
+        manifest['run_id'] = saved['run_id']
+        manifest['preload'] = saved.get('preload', manifest['preload'])
+        restore_rng(checkpoint['rng'])
+        print(f'Resuming epoch {start_epoch}, phase={phase}; source training epoch is not repeated')
+    elif Config.CHECKPOINT_PATH:
+        load_v5_checkpoints(model, Config.CHECKPOINT_PATH, expected=manifest)
+    elif Config.MODE in {'evaluate', 'submit'}:
+        raise ValueError('Set V5_CHECKPOINT to a new-format best_model.pth')
+    write_json(Path(Config.OUT_DIR) / 'run_manifest.json', manifest)
+    if Config.MODE == 'diagnose':
+        if Config.REPLAY_BATCH:
+            captured = torch.load(Config.REPLAY_BATCH, map_location='cpu', weights_only=True)
+            diagnostic_loader = [(captured['images'], captured['masks'], captured['spines'], captured['ids'])]
+        else:
+            diagnostic_loader = val_loader
+        # Full holdout by default, so the last singleton is included.
+        report = validate(model, diagnostic_loader, criterion)
+        write_json(Path(Config.OUT_DIR) / 'diagnostic_results.json', report)
+        return
+    if Config.PREFLIGHT:
+        preflight(model, val_loader)
+    if Config.MODE in {'train', 'smoke', 'benchmark'}:
+        final_epoch = 2 if Config.MODE == 'smoke' else (1 if Config.MODE == 'benchmark' else Config.EPOCHS)
+        history_path = Path(Config.OUT_DIR) / 'history.jsonl'
+        for epoch in range(start_epoch, final_epoch + 1):
+            if str(Config.DEVICE).startswith('cuda'):
+                for i in range(torch.cuda.device_count()):
+                    torch.cuda.reset_peak_memory_stats(i)
+            if phase != 'trained':
+                train_ds.epoch.fill_(epoch)
+                train_loader.generator.manual_seed(Config.SEED + epoch)
+                objective_epoch = Config.PROFILE_EPOCH if Config.MODE == 'benchmark' else epoch
+                last_train = train_epoch(model, train_loader, optimizer, criterion, scaler, objective_epoch)
+                last_train['objective_epoch'] = objective_epoch
+                # Written BEFORE eval; scheduler has not stepped for this epoch.
+                save_training_checkpoint(last_path, model, optimizer, scaler, scheduler, manifest,
+                                         epoch, 'trained', best_loss, last_train, best_model_state)
+            validation = validate(model, val_loader, criterion, epoch)
+            if validation['loss'] < best_loss:
+                best_loss = validation['loss']
+                metadata = {**manifest, 'epoch': epoch, 'validation': validation}
+                save_v5_checkpoints(model, model_path, bridge_path, metadata)
+                best_model_state = {'model': cpu_state(model), 'metadata': metadata}
+            scheduler.step()
+            save_training_checkpoint(last_path, model, optimizer, scaler, scheduler, manifest,
+                                     epoch, 'validated', best_loss, last_train, best_model_state)
+            with history_path.open('a') as handle:
+                handle.write(json.dumps({'run_id': manifest['run_id'], 'epoch': epoch, 'train': last_train,
+                                         'validation': validation, 'best_loss': best_loss}) + '\n')
+            phase = 'ready'
+        if best_model_state is None:
+            raise ValueError('No finite best checkpoint was produced or restored')
+        # Re-export saved best when resuming to a fresh Kaggle output directory.
+        unwrap_model(model).load_state_dict(best_model_state['model'], strict=True)
+        save_v5_checkpoints(model, model_path, bridge_path, best_model_state['metadata'])
+        load_v5_checkpoints(model, model_path, bridge_path, expected=manifest)
+        if Config.MODE == 'benchmark':
+            print(f'BENCHMARK COMPLETE: reports in {Config.OUT_DIR}; no full training/submission run')
+            return
+        if Config.MODE == 'smoke':
+            # Real native tiled + TTA path, RLE encoding/decoding, and visualization.
+            evaluate_native(model, coco, full_val_ids, limit=1)
+            smoke_paths = [str(Path(Config.TRAIN_DIR) / coco.imgs[full_val_ids[0]]['file_name'])]
+            generate_submission(model, smoke_paths, str(Path(Config.OUT_DIR) / 'smoke_submission.csv'))
+            visualize_predictions(model, coco, full_val_ids, Config.TRAIN_DIR, num_samples=1)
+            print('SMOKE PASS: two epochs, Lovasz activation, singleton eval, checkpoint reload, '
+                  'native tiles/TTA, RLE and visualization. Full 25-epoch/T4 verification remains.')
+            return
+    if Config.MODE == 'evaluate' or (Config.MODE == 'train' and Config.NATIVE_EVAL_AFTER_TRAIN):
+        evaluate_native(model, coco, full_val_ids, limit=Config.NATIVE_EVAL_LIMIT)
+    if Config.MODE in {'train', 'submit'}:
+        test_paths = sorted(glob.glob(os.path.join(Config.TEST_DIR, '*.jpeg')))
+        if not test_paths:
+            raise ValueError(f'No test images in {Config.TEST_DIR}')
+        if Config.EXPECTED_TEST_IMAGES and len(test_paths) != Config.EXPECTED_TEST_IMAGES:
+            raise ValueError(f'Expected {Config.EXPECTED_TEST_IMAGES} test images, found {len(test_paths)}')
+        generate_submission(model, test_paths, str(Path(Config.OUT_DIR) / 'submission.csv'))
+    for handle in handles:
+        handle.remove()
+    print(f'PIPELINE COMPLETE: {Config.OUT_DIR}')
 
-# Run the pipeline
-if __name__ == "__main__":
-    main()
 
-# %% [code] {"execution":{"iopub.status.busy":"2026-10-17T10:17:48.429154Z","iopub.status.idle":"2026-10-17T10:17:48.429410Z","shell.execute_reply.started":"2026-10-17T10:17:48.429294Z","shell.execute_reply":"2026-10-17T10:17:48.429307Z"}}
 # CELL 10: Optional - Visualize Sample Predictions
 # This cell shows a few example predictions overlaid on the original images
 # so you can visually verify the model quality before submitting.
@@ -1609,7 +2031,7 @@ def visualize_predictions(model, coco, img_ids, img_dir, num_samples=4):
             img_info = coco.imgs[img_id]
             img_path = os.path.join(img_dir, img_info['file_name'])
             
-            # Load and preprocess
+        # Load and preprocess
             img = load_image(img_path)
             img_3ch, img_limb = prepare_input_3ch(img)
             img_1024 = cv2.resize(img_3ch, (Config.IMG_SIZE, Config.IMG_SIZE))
@@ -1617,7 +2039,7 @@ def visualize_predictions(model, coco, img_ids, img_dir, num_samples=4):
                 Config.DEVICE, non_blocking=True
             )
             
-            with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=Config.DEVICE == 'cuda'):
+            with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=str(Config.DEVICE).startswith('cuda') and Config.EVAL_AMP):
                 logits = forward_model(model, tensor, return_aux=False)
             
             pred = (torch.sigmoid(logits) > Config.THRESHOLD).cpu().numpy().squeeze()
@@ -1645,95 +2067,9 @@ def visualize_predictions(model, coco, img_ids, img_dir, num_samples=4):
     
     plt.tight_layout()
     plt.savefig(os.path.join(Config.OUT_DIR, 'predictions.png'), dpi=150)
-    plt.show()
+    if plt.get_backend().lower() != 'agg':
+        plt.show()
+    plt.close(fig)
 
-# Run visualization (uses the trained model)
-# Uncomment after training is complete:
-# model = MagAgentU2Net(in_ch=Config.IN_CHANNELS).to(Config.DEVICE)
-# model.load_state_dict(torch.load(os.path.join(Config.OUT_DIR, 'best_model.pth')))
-# coco = COCO(Config.ANNOTATIONS_FILE)
-# visualize_predictions(model, coco, coco.getImgIds()[:4], Config.TRAIN_DIR)
-
-# %% [code] {"execution":{"iopub.status.busy":"2026-10-17T10:17:48.430759Z","iopub.status.idle":"2026-10-17T10:17:48.431131Z","shell.execute_reply.started":"2026-10-17T10:17:48.430930Z","shell.execute_reply":"2026-10-17T10:17:48.430946Z"}}
-# CELL: COCO JSON Diagnostic - Run this FIRST
-import json
-from pycocotools.coco import COCO
-
-ANNOTATIONS_FILE = '/kaggle/input/competitions/filament-segmentation-2026/MAGFiLO_1.0_Kaggle_2026/train/MAGFiLO_1.0_Annotations_kaggle2026_train.json'
-
-# === 1. Raw JSON structure ===
-with open(ANNOTATIONS_FILE, 'r') as f:
-    raw = json.load(f)
-
-print("="*60)
-print("TOP-LEVEL KEYS:", list(raw.keys()))
-print("="*60)
-
-for key in raw.keys():
-    val = raw[key]
-    if isinstance(val, list):
-        print(f"\n'{key}': list of {len(val)} items")
-        if len(val) > 0:
-            print(f"  First item: {val[0]}")
-            print(f"  Keys in first item: {list(val[0].keys()) if isinstance(val[0], dict) else type(val[0])}")
-    elif isinstance(val, dict):
-        print(f"\n'{key}': dict with keys {list(val.keys())[:10]}")
-    else:
-        print(f"\n'{key}': {val}")
-
-# === 2. Image ID types ===
-if 'images' in raw:
-    imgs = raw['images']
-    print("\n" + "="*60)
-    print(f"TOTAL IMAGES: {len(imgs)}")
-    print(f"Image ID types: {set(type(x['id']).__name__ for x in imgs[:20])}")
-    print(f"Sample image IDs: {[x['id'] for x in imgs[:5]]}")
-    print(f"Sample file_names: {[x['file_name'] for x in imgs[:5]]}")
-    print(f"Sample dimensions: {[(x.get('height'), x.get('width')) for x in imgs[:3]]}")
-    print("="*60)
-
-# === 3. Annotation details ===
-if 'annotations' in raw:
-    anns = raw['annotations']
-    print(f"\nTOTAL ANNOTATIONS: {len(anns)}")
-    print(f"Annotation keys: {list(anns[0].keys())}")
-    print(f"Sample annotation: {anns[0]}")
-    
-    # Check segmentation format
-    seg_types = set()
-    for a in anns[:100]:
-        seg = a.get('segmentation')
-        if seg is None:
-            seg_types.add('None')
-        elif isinstance(seg, dict):
-            seg_types.add('RLE_dict')
-        elif isinstance(seg, list):
-            seg_types.add('polygon_list')
-        else:
-            seg_types.add(type(seg).__name__)
-    print(f"Segmentation formats found: {seg_types}")
-
-# === 4. COCO API test ===
-print("\n" + "="*60)
-print("Testing COCO API...")
-try:
-    coco = COCO(ANNOTATIONS_FILE)
-    img_ids = coco.getImgIds()
-    print(f"coco.getImgIds() returned: {len(img_ids)} IDs")
-    print(f"First 5 IDs: {img_ids[:5]}")
-    print(f"ID types: {[type(x).__name__ for x in img_ids[:5]]}")
-    
-    # Try loading first image
-    try:
-        info = coco.loadImgs(img_ids[0])
-        print(f"loadImgs success: {info}")
-    except Exception as e:
-        print(f"loadImgs FAILED: {e}")
-        # Try direct access
-        print(f"coco.imgs keys sample: {list(coco.imgs.keys())[:5]}")
-        
-except Exception as e:
-    print(f"COCO API failed: {e}")
-
-print("="*60)
-print("DIAGNOSTIC COMPLETE")
+if __name__ == "__main__":
+    main()

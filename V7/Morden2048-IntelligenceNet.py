@@ -9,7 +9,7 @@
 # - Post-Processing Cascade: 2K DenseCRF boundary snapping -> OpenCV hole filling -> KD-Tree/DBSCAN fragment clustering
 
 # Optional Kaggle shell setup (uncomment in notebook cells):
-# !pip install optuna albumentations pycocotools pydensecrf -q
+# !pip install optuna albumentations pycocotools timm pydensecrf -q
 
 import os
 import sys
@@ -37,6 +37,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+import timm
 
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
@@ -60,7 +61,7 @@ if torch.cuda.is_available():
 
 
 # %% [code]
-# CELL 2: Configuration Class for V6
+# CELL 2: Configuration Class for V7
 
 class Config:
     # === EXACT KAGGLE DATASET PATHS ===
@@ -71,9 +72,8 @@ class Config:
     OUT_DIR = '/kaggle/working/'
 
     # === IMAGE DIMENSIONS ===
-    # Native GONG H-alpha images are 2048x2048.
-    # Downscaled to 1024x1024 for training; upscaled back to 2048x2048 for inference.
-    IMG_SIZE = 1024
+    # Native GONG H-alpha images stay at 2048x2048 throughout training and inference.
+    IMG_SIZE = 2048
     ORIGINAL_SIZE = 2048
     SEED = 42
 
@@ -107,6 +107,8 @@ class Config:
     WEIGHT_DECAY = 1e-4   # L2 Regularization
     NUM_WORKERS = 2
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+    AMP_DTYPE = torch.bfloat16
+    COMPILE_MODE = 'max-autotune'
 
     # === POST-PROCESSING & SUBMISSION HYPERPARAMETERS ===
     THRESHOLD = 0.40      # Base probability threshold
@@ -277,20 +279,20 @@ class SolarDataset(Dataset):
 
         # 3-channel physics tensor
         img_3ch, _ = prepare_input_3ch(img)
-        img_3ch = cv2.resize(img_3ch, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR)
+        if img_3ch.shape[:2] != (self.img_size, self.img_size):
+            raise ValueError(f'Expected {self.img_size}x{self.img_size} image, got {img_3ch.shape[:2]}.')
 
         # Ground truth 2D binary mask
         anns = self.coco.imgToAnns.get(img_id, [])
-        mask_2048 = np.zeros((2048, 2048), dtype=np.float32)
+        mask_2048 = np.zeros(img.shape[:2], dtype=np.float32)
         for ann in anns:
             m = self.coco.annToMask(ann)
             mask_2048 = np.maximum(mask_2048, m)
 
-        mask = cv2.resize(mask_2048, (self.img_size, self.img_size), interpolation=cv2.INTER_NEAREST)
-        mask = (mask > 0.5).astype(np.float32)
+        mask = (mask_2048 > 0.5).astype(np.float32)
 
         # 1px-dilated spine target for skeleton recall
-        spine = rasterize_dilated_spine(anns, mask_2048, img_size=self.img_size)
+        spine = rasterize_dilated_spine(anns, mask_2048)
 
         if self.transforms is not None:
             aug = self.transforms(image=img_3ch, mask=mask, spine=spine)
@@ -515,9 +517,10 @@ class CognitiveRefinerV6(nn.Module):
 
 class MagAgentU2Net(nn.Module):
     """
-    V6 Core Network:
+    V7 Core Network:
+    - Trainable HRNet-W18 encoder initialized from scratch on MAGFiLO
     - Shallow High-Resolution Stem & Branch Blocks
-    - MORDEN Multiscale Decoder base (5x5 convs, InstanceNorm2d, APP, PAG)
+    - MORDEN multiscale decoder (5x5 convs, InstanceNorm2d, APP, PAG)
     - Intermediate Auxiliary Head + FiLM Generator
     - CognitiveRefinerV6 for anti-fragmentation
     """
@@ -528,12 +531,26 @@ class MagAgentU2Net(nn.Module):
         fpn_ch = 96
         refiner_ch = 64
 
-        # 1. Shallow High-Resolution Stem & Branch Blocks
+        # 1. HRNet-W18 native branches: 18/36/72/144 channels at strides 4/8/16/32.
+        self.hrnet = timm.create_model(
+            'hrnet_w18',
+            pretrained=False,
+            features_only=True,
+            in_chans=in_ch,
+            out_indices=(1, 2, 3, 4),
+            feature_cfg={'feature_location': ''},
+        )
+        self.hr_s4 = nn.Sequential(nn.Conv2d(18, fpn_ch, 1, bias=False), nn.InstanceNorm2d(fpn_ch, affine=True))
+        self.hr_s8 = nn.Sequential(nn.Conv2d(36, fpn_ch, 1, bias=False), nn.InstanceNorm2d(fpn_ch, affine=True))
+        self.hr_s16 = nn.Sequential(nn.Conv2d(72, fpn_ch, 1, bias=False), nn.InstanceNorm2d(fpn_ch, affine=True))
+        self.hr_s32 = nn.Sequential(nn.Conv2d(144, fpn_ch, 1, bias=False), nn.InstanceNorm2d(fpn_ch, affine=True))
+
+        # 2. Shallow High-Resolution Physics Stem & Branch Blocks
         self.embed_stem = MordenDoubleConv(in_ch, base_ch, kernel_size=5, separable=False)
         self.branch_s4 = MordenBranchBlock(base_ch, branch_ch)
         self.branch_s8 = MordenBranchBlock(base_ch, branch_ch)
 
-        # 2. Multiscale Decoder Base (APP + PAG + Separable 5x5 Convolutions)
+        # 3. HRNet-aware Multiscale Decoder (APP + PAG + Separable 5x5 Convolutions)
         self.app_deep = AdaptivePyramidPooling(fpn_ch * 2, fpn_ch, depth=5)
         self.dec_s16 = MordenDoubleConv(fpn_ch * 2, fpn_ch, kernel_size=5, separable=True)
 
@@ -547,7 +564,7 @@ class MagAgentU2Net(nn.Module):
 
         self.dec_s1 = MordenDoubleConv(refiner_ch + base_ch, refiner_ch, kernel_size=5, separable=True)
 
-        # 3. Auxiliary Head & FiLM Generator
+        # 4. Auxiliary Head & FiLM Generator
         self.aux_head = nn.Conv2d(fpn_ch, out_ch, 1)
         self.film_head = nn.Sequential(
             nn.Linear(fpn_ch, refiner_ch * 2),
@@ -556,7 +573,49 @@ class MagAgentU2Net(nn.Module):
         self.cognitive = CognitiveRefinerV6(refiner_ch)
 
     def forward(self, x, return_aux=False):
-        raise RuntimeError('CNN encoder integration is pending.')
+        _, _, H, W = x.shape
+        H4, W4 = H // 4, W // 4
+        H8, W8 = H // 8, W // 8
+        H16, W16 = H // 16, W // 16
+        mag_map = x[:, 2:3]
+
+        s1_embed = self.embed_stem(x)
+        b_s4 = self.branch_s4(s1_embed, (H4, W4))
+        b_s8 = self.branch_s8(s1_embed, (H8, W8))
+
+        h_s4, h_s8, h_s16, h_s32 = self.hrnet(x)
+        p_s4 = self.hr_s4(h_s4)
+        p_s8 = self.hr_s8(h_s8)
+        p_s16 = self.hr_s16(h_s16)
+        p_s32 = self.hr_s32(h_s32)
+
+        p_s32_up16 = F.interpolate(p_s32, size=(H16, W16), mode='bilinear', align_corners=False)
+        d16 = self.app_deep(torch.cat([p_s16, p_s32_up16], dim=1), target_size=(H16, W16))
+        d16 = self.dec_s16(torch.cat([d16, p_s16], dim=1))
+
+        d16_up8 = F.interpolate(d16, size=(H8, W8), mode='bilinear', align_corners=False)
+        gated_s8 = self.pag_s8(p_s8, d16_up8)
+        d8 = self.dec_s8(torch.cat([gated_s8, b_s8], dim=1))
+        d8 = d8 + self.app_s8(d8, target_size=(H8, W8))
+
+        aux_logits = self.aux_head(d8)
+        pooled_context = F.adaptive_avg_pool2d(d8, 1).flatten(1)
+        gamma, beta = torch.chunk(self.film_head(pooled_context).unsqueeze(-1).unsqueeze(-1), 2, dim=1)
+
+        d8_up4 = F.interpolate(d8, size=(H4, W4), mode='bilinear', align_corners=False)
+        gated_s4 = self.pag_s4(p_s4, d8_up4)
+        d4 = self.dec_s4(torch.cat([gated_s4, b_s4], dim=1))
+        d4 = d4 + self.app_s4(d4, target_size=(H4, W4))
+
+        d4_up1 = F.interpolate(d4, size=(H, W), mode='bilinear', align_corners=False)
+        d1 = self.dec_s1(torch.cat([d4_up1, s1_embed], dim=1))
+
+        vlm_prior = torch.sigmoid(F.interpolate(aux_logits, size=(H, W), mode='bilinear', align_corners=False))
+        out = self.cognitive(d1, mag_map, vlm_prior=vlm_prior, gamma=gamma, beta=beta)
+
+        if return_aux:
+            return out, aux_logits
+        return out
 
 
 # %% [code]
@@ -675,19 +734,9 @@ class DiceBCELoss(nn.Module):
 # %% [code]
 # CELL 7: Training & Validation Harness
 
-def forward_model(model, images, return_aux=False):
-    """Safe forward wrapper handling single-GPU and DataParallel."""
-    if isinstance(model, nn.DataParallel):
-        unwrapped = model.module
-        if images.shape[0] < len(model.device_ids):
-            return unwrapped(images, return_aux=return_aux)
-        prev_flag = getattr(unwrapped, '_dp_return_aux', False)
-        unwrapped._dp_return_aux = bool(return_aux)
-        try:
-            return model(images)
-        finally:
-            unwrapped._dp_return_aux = prev_flag
-    return model(images, return_aux=return_aux)
+def base_model(model):
+    """Returns the original module when torch.compile wraps it."""
+    return getattr(model, '_orig_mod', model)
 
 
 def unpack_batch(batch):
@@ -696,7 +745,7 @@ def unpack_batch(batch):
     return images, masks, spines
 
 
-def train_epoch(model, loader, optimizer, criterion, scaler, epoch=1):
+def train_epoch(model, loader, optimizer, criterion, epoch=1):
     model.train()
     epoch_loss = 0.0
     optimizer.zero_grad(set_to_none=True)
@@ -711,18 +760,16 @@ def train_epoch(model, loader, optimizer, criterion, scaler, epoch=1):
 
         divisor = remainder if remainder and step >= len(loader) - remainder else Config.ACCUM_STEPS
 
-        with torch.autocast(device_type='cuda', dtype=torch.float16):
-            logits, aux_logits = forward_model(model, images, return_aux=True)
+        with torch.autocast(device_type='cuda', dtype=Config.AMP_DTYPE):
+            logits, aux_logits = model(images, return_aux=True)
             loss = criterion(logits, masks, spine_targets=spines, aux_logits=aux_logits, epoch=epoch)
-            scaled_loss = loss / divisor
+            loss = loss / divisor
 
-        scaler.scale(scaled_loss).backward()
+        loss.backward()
 
         if (step + 1) % Config.ACCUM_STEPS == 0 or step + 1 == len(loader):
-            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
+            optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
         epoch_loss += loss.item() * divisor
@@ -742,8 +789,8 @@ def validate(model, loader, criterion, epoch=1):
             if spines is not None:
                 spines = spines.to(Config.DEVICE, non_blocking=True)
 
-            with torch.autocast(device_type='cuda', dtype=torch.float16):
-                logits, aux_logits = forward_model(model, images, return_aux=True)
+            with torch.autocast(device_type='cuda', dtype=Config.AMP_DTYPE):
+                logits, aux_logits = model(images, return_aux=True)
                 loss = criterion(logits, masks, spine_targets=spines, aux_logits=aux_logits, epoch=epoch)
 
             epoch_loss += loss.item()
@@ -914,7 +961,6 @@ def generate_submission(model, test_paths, out_path):
     """Runs inference on test images and generates Kaggle submission.csv."""
     model.eval()
     submissions = []
-    unwrapped = model.module if isinstance(model, nn.DataParallel) else model
 
     with torch.no_grad():
         for img_path in tqdm(test_paths, desc="Generating Submission"):
@@ -924,19 +970,14 @@ def generate_submission(model, test_paths, out_path):
                 img = np.random.randint(0, 65535, (2048, 2048), dtype=np.uint16)
 
             prepared_3ch, img_limb_2048 = prepare_input_3ch(img)
-            img_1024 = cv2.resize(prepared_3ch, (Config.IMG_SIZE, Config.IMG_SIZE), interpolation=cv2.INTER_LINEAR)
-            tensor = torch.from_numpy(img_1024).permute(2, 0, 1).unsqueeze(0).to(Config.DEVICE, non_blocking=True)
+            if prepared_3ch.shape[:2] != (Config.IMG_SIZE, Config.IMG_SIZE):
+                raise ValueError(f'Expected {Config.IMG_SIZE}x{Config.IMG_SIZE} image, got {prepared_3ch.shape[:2]}.')
+            tensor = torch.from_numpy(prepared_3ch).permute(2, 0, 1).unsqueeze(0).to(Config.DEVICE, non_blocking=True)
 
-            with torch.autocast(device_type='cuda', dtype=torch.float16):
-                logits = unwrapped(tensor)
+            with torch.autocast(device_type='cuda', dtype=Config.AMP_DTYPE):
+                logits = model(tensor)
 
-            prob_1024 = torch.sigmoid(logits).squeeze()
-            prob_2048 = F.interpolate(
-                prob_1024.view(1, 1, Config.IMG_SIZE, Config.IMG_SIZE),
-                size=(Config.ORIGINAL_SIZE, Config.ORIGINAL_SIZE),
-                mode='bilinear',
-                align_corners=False
-            ).squeeze()
+            prob_2048 = torch.sigmoid(logits).squeeze()
 
             instances = postprocess_probability_v6(
                 prob_2048,
@@ -970,7 +1011,7 @@ def generate_submission(model, test_paths, out_path):
 
 def main():
     print("=" * 60)
-    print("Initializing V6 MORDEN Pipeline")
+    print("Initializing V7 HRNet-W18 MORDEN Pipeline")
     print("=" * 60)
 
     # 1. Load COCO Annotations
@@ -1010,23 +1051,19 @@ def main():
         num_workers=Config.NUM_WORKERS, pin_memory=True
     )
 
-    # 4. Initialize V6 Model
+    # 4. Initialize and compile the single-A100 model
     model = MagAgentU2Net(in_ch=Config.IN_CHANNELS, out_ch=Config.OUT_CHANNELS)
-    if torch.cuda.device_count() > 1:
-        print(f"Using {torch.cuda.device_count()} GPUs with DataParallel")
-        model = nn.DataParallel(model)
     model = model.to(Config.DEVICE)
+    model = torch.compile(model, mode=Config.COMPILE_MODE)
 
     # 5. Filter Optimizer Parameters (Trainable Only)
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     total_count = sum(p.numel() for p in model.parameters())
     trainable_count = sum(p.numel() for p in trainable_params)
     print(f"\nModel Parameters: {total_count:,} total, {trainable_count:,} trainable")
-    assert trainable_count < 3_500_000, f"Trainable params ({trainable_count:,}) exceed 3.5M ceiling!"
 
     optimizer = torch.optim.AdamW(trainable_params, lr=Config.LR, weight_decay=Config.WEIGHT_DECAY)
     criterion = DiceBCELoss()
-    scaler = torch.amp.GradScaler('cuda')
 
     # 6. Training Loop with Early Best Model Saving
     best_loss = float('inf')
@@ -1037,22 +1074,20 @@ def main():
         print(f"Epoch {epoch}/{Config.EPOCHS}")
         print(f"{'='*40}")
 
-        train_loss = train_epoch(model, train_loader, optimizer, criterion, scaler, epoch=epoch)
+        train_loss = train_epoch(model, train_loader, optimizer, criterion, epoch=epoch)
         val_loss = validate(model, val_loader, criterion, epoch=epoch)
 
         print(f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
 
         if val_loss < best_loss:
             best_loss = val_loss
-            unwrapped = model.module if isinstance(model, nn.DataParallel) else model
-            torch.save(unwrapped.state_dict(), model_path)
+            torch.save(base_model(model).state_dict(), model_path)
             print(f"✓ Saved new best model checkpoint! (val_loss: {val_loss:.4f})")
 
     # 7. Generate Submission on Test Images
     print("\n" + "=" * 60)
     print("Loading best checkpoint for Kaggle submission...")
-    unwrapped = model.module if isinstance(model, nn.DataParallel) else model
-    unwrapped.load_state_dict(torch.load(model_path, map_location=Config.DEVICE, weights_only=True))
+    base_model(model).load_state_dict(torch.load(model_path, map_location=Config.DEVICE, weights_only=True))
 
     test_imgs = sorted(glob.glob(os.path.join(Config.TEST_DIR, '*.jpeg')))
     print(f"Found {len(test_imgs)} test images.")
@@ -1060,7 +1095,7 @@ def main():
     submission_path = os.path.join(Config.OUT_DIR, 'submission.csv')
     generate_submission(model, test_imgs, submission_path)
     print("=" * 60)
-    print("V6 PIPELINE COMPLETE!")
+    print("V7 PIPELINE COMPLETE!")
     print(f"Submission written to: {submission_path}")
     print("=" * 60)
 

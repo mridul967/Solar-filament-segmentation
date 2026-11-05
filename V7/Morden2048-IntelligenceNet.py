@@ -1,7 +1,6 @@
 # CELL 1: Downloading important binaries and importing libraries
-# V6 (DinoV3MordenNet): Fully integrated solar filament instance segmentation model
+# V7: Solar filament instance segmentation model
 # Key upgrades:
-# - Strictly frozen DINOv3 ViT-Small backbone (0 trainable encoder params)
 # - Lightweight MORDEN Decoder (5x5 Convolutions, InstanceNorm2d, LeakyReLU(0.01), Dropout2d(0.10))
 # - Hierarchical Adaptive Pyramid Pooling (APP, depth=5) and dynamic Patch Attention Gates (PAG)
 # - Shallow 2-stage CNN stem (preserving high-res edge barbs at strides 4 and 1)
@@ -10,7 +9,7 @@
 # - Post-Processing Cascade: 2K DenseCRF boundary snapping -> OpenCV hole filling -> KD-Tree/DBSCAN fragment clustering
 
 # Optional Kaggle shell setup (uncomment in notebook cells):
-# !pip install optuna albumentations pycocotools timm pydensecrf -q
+# !pip install optuna albumentations pycocotools pydensecrf -q
 
 import os
 import sys
@@ -44,17 +43,7 @@ from albumentations.pytorch import ToTensorV2
 from pycocotools.coco import COCO
 from pycocotools import mask as maskUtils
 
-# Optional external backbones and CRF tools with safe fallbacks
-try:
-    import timm
-except ImportError:
-    timm = None
-
-try:
-    from transformers import AutoModel
-except ImportError:
-    AutoModel = None
-
+# Optional CRF tools with safe fallbacks
 try:
     import pydensecrf.densecrf as dcrf
     from pydensecrf.utils import unary_from_softmax
@@ -71,7 +60,7 @@ if torch.cuda.is_available():
 
 
 # %% [code]
-# CELL 2: Configuration Class for V6 (DinoV3MordenNet)
+# CELL 2: Configuration Class for V6
 
 class Config:
     # === EXACT KAGGLE DATASET PATHS ===
@@ -92,12 +81,6 @@ class Config:
     IN_CHANNELS = 3       # [Limb-corrected H-alpha, Filament Valley Map, Magnetic Structure Tensor Coherence]
     OUT_CHANNELS = 1      # Binary segmentation mask
     
-    # DINOv3 Backbone Settings
-    DINO_TIMM_NAME = 'vit_small_patch16_dinov3.lvd1689m'
-    DINO_HF_NAME = 'facebook/dinov3-vits16-pretrain-lvd1689m'
-    DINO_FALLBACK_TIMM = 'vit_small_patch14_dinov2.lvd142m'
-    DINO_OUT_INDICES = (2, 5, 8, 11)  # 4 multi-scale transformer stages
-
     # MORDEN Hyperparameters (Hu et al., 2026)
     BASE_CHANNELS = 40
     MID_CHANNELS = 40
@@ -361,9 +344,7 @@ val_transforms = A.Compose([ToTensorV2()], additional_targets={'spine': 'mask'})
 
 
 # %% [code]
-# CELL 5: V6 Model Architecture (DinoV3MordenNet)
-
-# removed DINO architecture frozen to be replaced by CNN architecture of Unet 
+# CELL 5: V6 Model Architecture
 
 class MordenDoubleConv(nn.Module):
     """
@@ -534,10 +515,9 @@ class CognitiveRefinerV6(nn.Module):
 
 class MagAgentU2Net(nn.Module):
     """
-    V6 Core Network (DinoV3MordenNet):
-    - Frozen DINOv3 ViT-Small Encoder (0 trainable params)
-    - Shallow High-Res Stem & Branch Blocks (256x256 and 128x128 shortcuts)
-    - MORDEN Multiscale Decoder (5x5 convs, InstanceNorm2d, APP, PAG)
+    V6 Core Network:
+    - Shallow High-Resolution Stem & Branch Blocks
+    - MORDEN Multiscale Decoder base (5x5 convs, InstanceNorm2d, APP, PAG)
     - Intermediate Auxiliary Head + FiLM Generator
     - CognitiveRefinerV6 for anti-fragmentation
     """
@@ -548,22 +528,12 @@ class MagAgentU2Net(nn.Module):
         fpn_ch = 96
         refiner_ch = 64
 
-        # 1. Strictly Frozen DINOv3 Backbone
-        self.dino = FrozenDINOv3Encoder()
-        dino_dim = self.dino.embed_dim
-
-        # 2. Shallow High-Resolution Stem & Branch Blocks
+        # 1. Shallow High-Resolution Stem & Branch Blocks
         self.embed_stem = MordenDoubleConv(in_ch, base_ch, kernel_size=5, separable=False)
         self.branch_s4 = MordenBranchBlock(base_ch, branch_ch)
         self.branch_s8 = MordenBranchBlock(base_ch, branch_ch)
 
-        # 3. Lateral 1x1 Adapters from 4 Transformer Stages
-        self.lat1 = nn.Sequential(nn.Conv2d(dino_dim, fpn_ch, 1, bias=False), nn.InstanceNorm2d(fpn_ch, affine=True))
-        self.lat2 = nn.Sequential(nn.Conv2d(dino_dim, fpn_ch, 1, bias=False), nn.InstanceNorm2d(fpn_ch, affine=True))
-        self.lat3 = nn.Sequential(nn.Conv2d(dino_dim, fpn_ch, 1, bias=False), nn.InstanceNorm2d(fpn_ch, affine=True))
-        self.lat4 = nn.Sequential(nn.Conv2d(dino_dim, fpn_ch, 1, bias=False), nn.InstanceNorm2d(fpn_ch, affine=True))
-
-        # 4. Multiscale Decoder (APP + PAG + Separable 5x5 Convolutions)
+        # 2. Multiscale Decoder Base (APP + PAG + Separable 5x5 Convolutions)
         self.app_deep = AdaptivePyramidPooling(fpn_ch * 2, fpn_ch, depth=5)
         self.dec_s16 = MordenDoubleConv(fpn_ch * 2, fpn_ch, kernel_size=5, separable=True)
 
@@ -577,7 +547,7 @@ class MagAgentU2Net(nn.Module):
 
         self.dec_s1 = MordenDoubleConv(refiner_ch + base_ch, refiner_ch, kernel_size=5, separable=True)
 
-        # 5. Auxiliary Head & FiLM Generator
+        # 3. Auxiliary Head & FiLM Generator
         self.aux_head = nn.Conv2d(fpn_ch, out_ch, 1)
         self.film_head = nn.Sequential(
             nn.Linear(fpn_ch, refiner_ch * 2),
@@ -586,50 +556,7 @@ class MagAgentU2Net(nn.Module):
         self.cognitive = CognitiveRefinerV6(refiner_ch)
 
     def forward(self, x, return_aux=False):
-        B, _, H, W = x.shape
-        H4, W4 = H // 4, W // 4
-        H8, W8 = H // 8, W // 8
-        H16, W16 = H // 16, W // 16
-        mag_map = x[:, 2:3, :, :]
-
-        s1_embed = self.embed_stem(x)
-        b_s4 = self.branch_s4(s1_embed, (H4, W4))
-        b_s8 = self.branch_s8(s1_embed, (H8, W8))
-
-        f1, f2, f3, f4 = self.dino(x)
-        p1 = F.interpolate(self.lat1(f1), size=(H16, W16), mode='bilinear', align_corners=False)
-        p2 = F.interpolate(self.lat2(f2), size=(H16, W16), mode='bilinear', align_corners=False)
-        p3 = F.interpolate(self.lat3(f3), size=(H16, W16), mode='bilinear', align_corners=False)
-        p4 = F.interpolate(self.lat4(f4), size=(H16, W16), mode='bilinear', align_corners=False)
-
-        d16 = self.app_deep(torch.cat([p3, p4], dim=1), target_size=(H16, W16))
-        d16 = self.dec_s16(torch.cat([d16, p2], dim=1))
-
-        p1_up8 = F.interpolate(p1, size=(H8, W8), mode='bilinear', align_corners=False)
-        d16_up8 = F.interpolate(d16, size=(H8, W8), mode='bilinear', align_corners=False)
-        gated_s8 = self.pag_s8(p1_up8, d16_up8)
-        d8 = self.dec_s8(torch.cat([gated_s8, b_s8], dim=1))
-        d8 = d8 + self.app_s8(d8, target_size=(H8, W8))
-
-        aux_logits = self.aux_head(d8)
-        pooled_context = F.adaptive_avg_pool2d(d8, 1).flatten(1)
-        gamma, beta = torch.chunk(self.film_head(pooled_context).unsqueeze(-1).unsqueeze(-1), 2, dim=1)
-
-        d8_up4 = F.interpolate(d8, size=(H4, W4), mode='bilinear', align_corners=False)
-        p1_up4 = F.interpolate(p1, size=(H4, W4), mode='bilinear', align_corners=False)
-        gated_s4 = self.pag_s4(p1_up4, d8_up4)
-        d4 = self.dec_s4(torch.cat([gated_s4, b_s4], dim=1))
-        d4 = d4 + self.app_s4(d4, target_size=(H4, W4))
-
-        d4_up1 = F.interpolate(d4, size=(H, W), mode='bilinear', align_corners=False)
-        d1 = self.dec_s1(torch.cat([d4_up1, s1_embed], dim=1))
-
-        vlm_prior = torch.sigmoid(F.interpolate(aux_logits, size=(H, W), mode='bilinear', align_corners=False))
-        out = self.cognitive(d1, mag_map, vlm_prior=vlm_prior, gamma=gamma, beta=beta)
-
-        if return_aux or getattr(self, '_dp_return_aux', False):
-            return out, aux_logits
-        return out
+        raise RuntimeError('CNN encoder integration is pending.')
 
 
 # %% [code]
@@ -1043,7 +970,7 @@ def generate_submission(model, test_paths, out_path):
 
 def main():
     print("=" * 60)
-    print("Initializing V6 (DinoV3MordenNet) Pipeline")
+    print("Initializing V6 MORDEN Pipeline")
     print("=" * 60)
 
     # 1. Load COCO Annotations

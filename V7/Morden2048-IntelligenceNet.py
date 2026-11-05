@@ -4,9 +4,9 @@
 # - Lightweight MORDEN Decoder (5x5 Convolutions, InstanceNorm2d, LeakyReLU(0.01), Dropout2d(0.10))
 # - Hierarchical Adaptive Pyramid Pooling (APP, depth=5) and dynamic Patch Attention Gates (PAG)
 # - Shallow 2-stage CNN stem (preserving high-res edge barbs at strides 4 and 1)
-# - CognitiveRefinerV6 with multi-scale dilated convolutions (d=2,4,8), FiLM conditioning & magnetic gating
-# - Compound Loss: 1.0 * Dice + 1.0 * Focal(alpha=0.66, gamma=2.0) + w_lovasz * LovaszHinge + 0.25 * SkeletonRecall + 0.15 * AuxBCE
-# - Post-Processing Cascade: 2K DenseCRF boundary snapping -> OpenCV hole filling -> KD-Tree/DBSCAN fragment clustering
+# - IntelligenceRefiner with multi-scale dilated convolutions, FiLM conditioning, magnetic gating, and explicit decision heads
+# - Compound foreground/topology loss plus boundary, spine, seed, uncertainty, and auxiliary foreground supervision
+# - Post-Processing Cascade: mandatory 2K DenseCRF -> learned seed/boundary watershed -> topology-safe instance export
 
 # Optional Kaggle shell setup (uncomment in notebook cells):
 # !pip install optuna albumentations pycocotools timm pydensecrf -q
@@ -47,8 +47,6 @@ from pycocotools import mask as maskUtils
 import pydensecrf.densecrf as dcrf
 from pydensecrf.utils import unary_from_softmax
 
-from sklearn.cluster import DBSCAN
-from scipy.spatial import cKDTree
 
 print(f"PyTorch Version: {torch.__version__}")
 print(f"CUDA Available: {torch.cuda.is_available()}")
@@ -94,6 +92,10 @@ class Config:
     LOVASZ_WARMUP_EPOCHS = 5
     SKEL_RECALL_WEIGHT = 0.25
     AUX_BCE_WEIGHT = 0.15
+    BOUNDARY_WEIGHT = 0.20
+    SPINE_WEIGHT = 0.25
+    SEED_WEIGHT = 0.20
+    UNCERTAINTY_WEIGHT = 0.10
 
     # === TRAINING HYPERPARAMETERS ===
     BATCH_SIZE = 2
@@ -109,6 +111,12 @@ class Config:
     # === POST-PROCESSING & SUBMISSION HYPERPARAMETERS ===
     THRESHOLD = 0.40      # Base probability threshold
     MIN_AREA = 200        # Minimum pixel area filtering out granulation noise
+    BOUNDARY_THRESHOLD = 0.50
+    SPINE_THRESHOLD = 0.50
+    SEED_THRESHOLD = 0.50
+    UNCERTAINTY_THRESHOLD = 0.60
+    MIN_SEED_AREA = 9
+    PQ_IOU_THRESHOLD = 0.50
     
     # 2K DenseCRF Settings
     CRF_W1 = 40.0
@@ -118,10 +126,6 @@ class Config:
     CRF_THETA_GAMMA_SQ = 3.0   # Gaussian spatial smoothness std^2
     CRF_ITERATIONS = 10
 
-    # DBSCAN Fragment Integration Settings
-    USE_DBSCAN = True
-    DBSCAN_EPS = 28.0          # Spatial distance threshold (pixels at 2K resolution)
-    DBSCAN_MIN_PTS = 140       # Minimum cluster points
 
 print(f"Train dir exists: {os.path.exists(Config.TRAIN_DIR)}")
 print(f"Test dir exists:  {os.path.exists(Config.TEST_DIR)}")
@@ -261,21 +265,66 @@ def rasterize_dilated_spine(anns, mask_2048, img_size=None):
 # %% [code]
 # CELL 4: PyTorch Dataset with MORDEN Augmentations & Physics Guardrails
 
+def _spine_for_instance(ann, mask):
+    spine = rasterize_dilated_spine([ann], mask)
+    return spine if spine.max() else extract_morphological_centerline(mask)
+
+
+def build_instance_targets(coco, anns, shape):
+    """Build native-resolution semantic and instance-aware supervision for one annotation pass."""
+    masks = [(coco.annToMask(ann) > 0).astype(np.uint8) for ann in anns]
+    foreground = np.zeros(shape, dtype=np.float32)
+    boundary = np.zeros(shape, dtype=np.float32)
+    spine = np.zeros(shape, dtype=np.float32)
+    seed = np.zeros(shape, dtype=np.float32)
+    instance_id = np.zeros(shape, dtype=np.int32)
+    overlap_count = np.zeros(shape, dtype=np.uint8)
+
+    for index, (ann, mask) in enumerate(zip(anns, masks), start=1):
+        foreground = np.maximum(foreground, mask)
+        overlap_count += mask
+        instance_id[mask > 0] = index
+        inner_boundary = mask - cv2.erode(mask, np.ones((3, 3), np.uint8), iterations=1)
+        boundary = np.maximum(boundary, cv2.dilate(inner_boundary, np.ones((3, 3), np.uint8), iterations=1))
+        instance_spine = _spine_for_instance(ann, mask)
+        spine = np.maximum(spine, instance_spine)
+        points = np.argwhere(instance_spine > 0)
+        if len(points):
+            y, x = points[len(points) // 2]
+            cv2.circle(seed, (int(x), int(y)), 2, 1, thickness=-1)
+
+    ambiguous = overlap_count > 1
+    instance_id[ambiguous] = -1
+    boundary_valid = (~ambiguous).astype(np.float32)
+    return {
+        'foreground': foreground.astype(np.float32),
+        'boundary': boundary.astype(np.float32),
+        'spine': spine.astype(np.float32),
+        'seed': np.minimum(seed, foreground).astype(np.float32),
+        'uncertainty': np.zeros(shape, dtype=np.float32),
+        'uncertainty_valid': np.zeros(shape, dtype=np.float32),
+        'boundary_valid': boundary_valid,
+        'instance_id': instance_id,
+    }
+
+
 class SolarDataset(Dataset):
-    def __init__(self, coco, img_ids, img_dir, img_size=1024, transforms=None):
+    def __init__(self, coco, records_by_filename, file_names, img_dir, img_size=2048, transforms=None, training=False):
         self.coco = coco
-        self.img_ids = img_ids
+        self.records_by_filename = records_by_filename
+        self.file_names = file_names
         self.img_dir = img_dir
         self.img_size = img_size
         self.transforms = transforms
+        self.training = training
 
     def __len__(self):
-        return len(self.img_ids)
+        return len(self.file_names)
 
     def __getitem__(self, idx):
-        img_id = self.img_ids[idx]
-        img_info = self.coco.imgs[img_id]
-        file_name = img_info['file_name']
+        file_name = self.file_names[idx]
+        image_ids = self.records_by_filename[file_name]
+        img_id = random.choice(image_ids) if self.training else image_ids[0]
         img_path = os.path.join(self.img_dir, file_name)
 
         img = load_image(img_path)
@@ -285,40 +334,34 @@ class SolarDataset(Dataset):
         if img_3ch.shape[:2] != (self.img_size, self.img_size):
             raise ValueError(f'Expected {self.img_size}x{self.img_size} image, got {img_3ch.shape[:2]}.')
 
-        # Ground truth 2D binary mask
         anns = self.coco.imgToAnns.get(img_id, [])
-        mask_2048 = np.zeros(img.shape[:2], dtype=np.float32)
-        for ann in anns:
-            m = self.coco.annToMask(ann)
-            mask_2048 = np.maximum(mask_2048, m)
-
-        mask = (mask_2048 > 0.5).astype(np.float32)
-
-        # 1px-dilated spine target for skeleton recall
-        spine = rasterize_dilated_spine(anns, mask_2048)
+        targets = build_instance_targets(self.coco, anns, img.shape)
+        if len(image_ids) > 1:
+            pass_foregrounds = [
+                build_instance_targets(self.coco, self.coco.imgToAnns.get(pass_id, []), img.shape)['foreground']
+                for pass_id in image_ids
+            ]
+            targets['uncertainty'] = (np.max(pass_foregrounds, axis=0) != np.min(pass_foregrounds, axis=0)).astype(np.float32)
+            targets['uncertainty_valid'] = np.ones(img.shape, dtype=np.float32)
 
         if self.transforms is not None:
-            aug = self.transforms(image=img_3ch, mask=mask, spine=spine)
+            aug = self.transforms(image=img_3ch, mask=targets['foreground'], boundary=targets['boundary'],
+                                  spine=targets['spine'], seed=targets['seed'], uncertainty=targets['uncertainty'],
+                                  uncertainty_valid=targets['uncertainty_valid'], boundary_valid=targets['boundary_valid'])
             img_3ch = aug['image']
-            mask = aug['mask']
-            spine = aug['spine']
+            for key in ('foreground', 'boundary', 'spine', 'seed', 'uncertainty', 'uncertainty_valid', 'boundary_valid'):
+                targets[key] = aug['mask'] if key == 'foreground' else aug[key]
 
         if isinstance(img_3ch, np.ndarray):
             img_3ch = torch.from_numpy(img_3ch).permute(2, 0, 1).float()
         else:
             img_3ch = img_3ch.float()
 
-        if isinstance(mask, np.ndarray):
-            mask = torch.from_numpy(mask).unsqueeze(0).float()
-        else:
-            mask = mask.unsqueeze(0).float()
-
-        if isinstance(spine, np.ndarray):
-            spine = torch.from_numpy(spine).unsqueeze(0).float()
-        else:
-            spine = spine.unsqueeze(0).float()
-
-        return img_3ch, mask, spine
+        tensors = {}
+        for key, value in targets.items():
+            tensor = torch.from_numpy(value) if isinstance(value, np.ndarray) else value
+            tensors[key] = tensor.unsqueeze(0).float() if key != 'instance_id' else tensor.unsqueeze(0).long()
+        return img_3ch, tensors
 
 
 def build_morden_train_transforms():
@@ -341,11 +384,11 @@ def build_morden_train_transforms():
             p=0.9,
         ),
         ToTensorV2(),
-    ], additional_targets={'spine': 'mask'})
+    ], additional_targets={key: 'mask' for key in ('boundary', 'spine', 'seed', 'uncertainty', 'uncertainty_valid', 'boundary_valid')})
 
 
 train_transforms = build_morden_train_transforms()
-val_transforms = A.Compose([ToTensorV2()], additional_targets={'spine': 'mask'})
+val_transforms = A.Compose([ToTensorV2()], additional_targets={key: 'mask' for key in ('boundary', 'spine', 'seed', 'uncertainty', 'uncertainty_valid', 'boundary_valid')})
 
 
 # %% [code]
@@ -474,11 +517,8 @@ class MordenBranchBlock(nn.Module):
         return self.pag(pooled, feat)
 
 
-class CognitiveRefinerV6(nn.Module):
-    """
-    Topology-preserving refiner with dilated convolutions (d=2,4,8),
-    InstanceNorm2d, FiLM modulation, and magnetic proxy gating.
-    """
+class IntelligenceRefiner(nn.Module):
+    """Produces shared topology-aware features for explicit filament decision maps."""
     def __init__(self, in_ch=64, slope=Config.LEAKY_RELU_SLOPE):
         super().__init__()
         self.bridge1 = nn.Sequential(
@@ -501,7 +541,6 @@ class CognitiveRefinerV6(nn.Module):
             nn.InstanceNorm2d(in_ch, affine=True),
             nn.Sigmoid(),
         )
-        self.out_conv = nn.Conv2d(in_ch, 1, 1)
 
     def forward(self, x, mag_map, vlm_prior=None, gamma=None, beta=None):
         b1 = self.bridge1(x)
@@ -515,7 +554,7 @@ class CognitiveRefinerV6(nn.Module):
             vlm_prior = torch.full_like(mag_map, 0.5)
 
         g = self.gate(torch.cat([bridged, mag_map, vlm_prior], dim=1))
-        return self.out_conv(bridged * g)
+        return bridged * g
 
 
 class MagAgentU2Net(nn.Module):
@@ -524,8 +563,7 @@ class MagAgentU2Net(nn.Module):
     - Trainable HRNet-W18 encoder initialized from scratch on MAGFiLO
     - Shallow High-Resolution Stem & Branch Blocks
     - MORDEN multiscale decoder (5x5 convs, InstanceNorm2d, APP, PAG)
-    - Intermediate Auxiliary Head + FiLM Generator
-    - CognitiveRefinerV6 for anti-fragmentation
+    - Explicit foreground, boundary, spine, seed, and uncertainty decision maps
     """
     def __init__(self, in_ch=Config.IN_CHANNELS, out_ch=Config.OUT_CHANNELS):
         super().__init__()
@@ -567,15 +605,22 @@ class MagAgentU2Net(nn.Module):
 
         self.dec_s1 = MordenDoubleConv(refiner_ch + base_ch, refiner_ch, kernel_size=5, separable=True)
 
-        # 4. Auxiliary Head & FiLM Generator
-        self.aux_head = nn.Conv2d(fpn_ch, out_ch, 1)
+        # 4. Auxiliary foreground supervision, FiLM generation, and intelligence heads.
+        self.aux_foreground_head = nn.Conv2d(fpn_ch, out_ch, 1)
         self.film_head = nn.Sequential(
             nn.Linear(fpn_ch, refiner_ch * 2),
             nn.Tanh(),
         )
-        self.cognitive = CognitiveRefinerV6(refiner_ch)
+        self.intelligence = IntelligenceRefiner(refiner_ch)
+        self.decision_heads = nn.ModuleDict({
+            'foreground': nn.Conv2d(refiner_ch, out_ch, 1),
+            'boundary': nn.Conv2d(refiner_ch, out_ch, 1),
+            'spine': nn.Conv2d(refiner_ch, out_ch, 1),
+            'seed': nn.Conv2d(refiner_ch, out_ch, 1),
+            'uncertainty': nn.Conv2d(refiner_ch, out_ch, 1),
+        })
 
-    def forward(self, x, return_aux=False):
+    def forward(self, x):
         _, _, H, W = x.shape
         H4, W4 = H // 4, W // 4
         H8, W8 = H // 8, W // 8
@@ -601,7 +646,7 @@ class MagAgentU2Net(nn.Module):
         d8 = self.dec_s8(torch.cat([gated_s8, b_s8], dim=1))
         d8 = d8 + self.app_s8(d8, target_size=(H8, W8))
 
-        aux_logits = self.aux_head(d8)
+        aux_logits = self.aux_foreground_head(d8)
         pooled_context = F.adaptive_avg_pool2d(d8, 1).flatten(1)
         gamma, beta = torch.chunk(self.film_head(pooled_context).unsqueeze(-1).unsqueeze(-1), 2, dim=1)
 
@@ -614,11 +659,10 @@ class MagAgentU2Net(nn.Module):
         d1 = self.dec_s1(torch.cat([d4_up1, s1_embed], dim=1))
 
         vlm_prior = torch.sigmoid(F.interpolate(aux_logits, size=(H, W), mode='bilinear', align_corners=False))
-        out = self.cognitive(d1, mag_map, vlm_prior=vlm_prior, gamma=gamma, beta=beta)
-
-        if return_aux:
-            return out, aux_logits
-        return out
+        refined = self.intelligence(d1, mag_map, vlm_prior=vlm_prior, gamma=gamma, beta=beta)
+        outputs = {name: head(refined) for name, head in self.decision_heads.items()}
+        outputs['aux_foreground'] = aux_logits
+        return outputs
 
 
 # %% [code]
@@ -659,7 +703,7 @@ def lovasz_hinge_loss(logits, targets, per_image=True):
         return _lovasz_hinge_flat(logits_f.reshape(-1), targets_f.reshape(-1))
 
 
-class DiceBCELoss(nn.Module):
+class IntelligenceLoss(nn.Module):
     def __init__(
         self,
         dice_weight=Config.DICE_WEIGHT,
@@ -683,6 +727,15 @@ class DiceBCELoss(nn.Module):
         self.skel_weight = skel_weight
         self.aux_weight = aux_weight
 
+    def masked_bce_dice(self, logits, targets, valid=None):
+        valid = torch.ones_like(targets) if valid is None else valid.float()
+        denominator = valid.sum().clamp_min(1.0)
+        bce = (self.bce_none(logits.float(), targets.float()) * valid).sum() / denominator
+        probs = torch.sigmoid(logits.float()) * valid
+        target = targets.float() * valid
+        dice = 1.0 - (2.0 * (probs * target).sum() + 1.0) / (probs.sum() + target.sum() + 1.0)
+        return bce + dice
+
     def get_lovasz_weight(self, epoch=1):
         if self.lovasz_max_weight <= 0:
             return 0.0
@@ -691,10 +744,10 @@ class DiceBCELoss(nn.Module):
         progress = float(epoch - 1) / float(self.lovasz_warmup_epochs - 1)
         return float(self.lovasz_max_weight * min(1.0, max(0.0, progress)))
 
-    def forward(self, logits, targets, spine_targets=None, aux_logits=None, epoch=1):
+    def forward(self, outputs, targets, epoch=1):
         with torch.amp.autocast('cuda', enabled=False):
-            logits_f = logits.float()
-            targets_f = targets.float()
+            logits_f = outputs['foreground'].float()
+            targets_f = targets['foreground'].float()
 
             # 1. Soft Dice Loss
             probs = torch.sigmoid(logits_f)
@@ -719,19 +772,35 @@ class DiceBCELoss(nn.Module):
                 lovasz_loss = lovasz_hinge_loss(logits_f, targets_f, per_image=True)
                 total_loss = total_loss + w_lovasz * lovasz_loss
 
-            # 4. Skeleton Recall Loss on 1px-dilated spine
-            if spine_targets is not None and self.skel_weight > 0:
-                sflat = spine_targets.float().reshape(-1)
+            # 4. Skeleton recall keeps the main foreground decision continuous.
+            if self.skel_weight > 0:
+                sflat = targets['spine'].float().reshape(-1)
                 skel_recall = ((iflat * sflat).sum() + smooth) / (sflat.sum() + smooth)
                 total_loss = total_loss + self.skel_weight * (1.0 - skel_recall)
 
-            # 5. Intermediate Auxiliary Supervision
-            if aux_logits is not None and self.aux_weight > 0:
+            boundary_loss = self.masked_bce_dice(outputs['boundary'], targets['boundary'], targets['boundary_valid'])
+            spine_loss = self.masked_bce_dice(outputs['spine'], targets['spine'])
+            seed_loss = self.masked_bce_dice(outputs['seed'], targets['seed'])
+            uncertainty_valid = targets['uncertainty_valid']
+            uncertainty_loss = (self.bce_none(outputs['uncertainty'].float(), targets['uncertainty'].float()) * uncertainty_valid).sum()
+            uncertainty_loss = uncertainty_loss / uncertainty_valid.sum().clamp_min(1.0)
+            total_loss = total_loss + Config.BOUNDARY_WEIGHT * boundary_loss
+            total_loss = total_loss + Config.SPINE_WEIGHT * spine_loss
+            total_loss = total_loss + Config.SEED_WEIGHT * seed_loss
+            total_loss = total_loss + Config.UNCERTAINTY_WEIGHT * uncertainty_loss
+
+            # 5. Intermediate foreground supervision.
+            if self.aux_weight > 0:
+                aux_logits = outputs['aux_foreground']
                 aux_target = F.adaptive_max_pool2d(targets_f, output_size=aux_logits.shape[2:])
                 aux_loss = self.bce_mean(aux_logits.float(), aux_target)
                 total_loss = total_loss + self.aux_weight * aux_loss
 
-            return total_loss
+            return total_loss, {
+                'foreground': (self.dice_weight * dice_loss + self.focal_weight * focal_loss).detach(),
+                'boundary': boundary_loss.detach(), 'spine': spine_loss.detach(), 'seed': seed_loss.detach(),
+                'uncertainty': uncertainty_loss.detach(), 'total': total_loss.detach(),
+            }
 
 
 # %% [code]
@@ -743,29 +812,25 @@ def base_model(model):
 
 
 def unpack_batch(batch):
-    images, masks = batch[0], batch[1]
-    spines = batch[2] if len(batch) >= 3 else None
-    return images, masks, spines
+    return batch[0], batch[1]
 
 
 def train_epoch(model, loader, optimizer, criterion, epoch=1):
     model.train()
-    epoch_loss = 0.0
+    totals = defaultdict(float)
     optimizer.zero_grad(set_to_none=True)
     remainder = len(loader) % Config.ACCUM_STEPS
 
     for step, batch in enumerate(tqdm(loader, desc=f"Training Epoch {epoch}")):
-        images, masks, spines = unpack_batch(batch)
+        images, targets = unpack_batch(batch)
         images = images.to(Config.DEVICE, non_blocking=True)
-        masks = masks.to(Config.DEVICE, non_blocking=True)
-        if spines is not None:
-            spines = spines.to(Config.DEVICE, non_blocking=True)
+        targets = {key: value.to(Config.DEVICE, non_blocking=True) for key, value in targets.items()}
 
         divisor = remainder if remainder and step >= len(loader) - remainder else Config.ACCUM_STEPS
 
         with torch.autocast(device_type='cuda', dtype=Config.AMP_DTYPE):
-            logits, aux_logits = model(images, return_aux=True)
-            loss = criterion(logits, masks, spine_targets=spines, aux_logits=aux_logits, epoch=epoch)
+            outputs = model(images)
+            loss, pieces = criterion(outputs, targets, epoch=epoch)
             loss = loss / divisor
 
         loss.backward()
@@ -775,34 +840,34 @@ def train_epoch(model, loader, optimizer, criterion, epoch=1):
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
-        epoch_loss += loss.item() * divisor
+        for key, value in pieces.items():
+            totals[key] += float(value)
 
-    return epoch_loss / len(loader)
+    return {key: value / len(loader) for key, value in totals.items()}
 
 
 def validate(model, loader, criterion, epoch=1):
     model.eval()
-    epoch_loss = 0.0
+    totals = defaultdict(float)
 
     with torch.no_grad():
         for batch in tqdm(loader, desc="Validating"):
-            images, masks, spines = unpack_batch(batch)
+            images, targets = unpack_batch(batch)
             images = images.to(Config.DEVICE, non_blocking=True)
-            masks = masks.to(Config.DEVICE, non_blocking=True)
-            if spines is not None:
-                spines = spines.to(Config.DEVICE, non_blocking=True)
+            targets = {key: value.to(Config.DEVICE, non_blocking=True) for key, value in targets.items()}
 
             with torch.autocast(device_type='cuda', dtype=Config.AMP_DTYPE):
-                logits, aux_logits = model(images, return_aux=True)
-                loss = criterion(logits, masks, spine_targets=spines, aux_logits=aux_logits, epoch=epoch)
+                outputs = model(images)
+                _, pieces = criterion(outputs, targets, epoch=epoch)
 
-            epoch_loss += loss.item()
+            for key, value in pieces.items():
+                totals[key] += float(value)
 
-    return epoch_loss / len(loader)
+    return {key: value / len(loader) for key, value in totals.items()}
 
 
 # %% [code]
-# CELL 8: Post-Processing Cascade (DenseCRF -> Hole Filling -> DBSCAN) & Submission
+# CELL 8: Post-Processing Cascade (DenseCRF -> Learned Watershed) & Submission
 
 def apply_densecrf_2k(prob_2k, img_limb_2k):
     """Applies mandatory DenseCRF boundary refinement at 2048x2048."""
@@ -841,111 +906,119 @@ def fill_fragment_holes(mask_u8):
     return filled
 
 
-def cluster_fragments_dbscan(mask_u8, eps=Config.DBSCAN_EPS, min_pts=Config.DBSCAN_MIN_PTS, min_area=Config.MIN_AREA):
-    """
-    Integrates broken filament fragments into unified instance masks using DBSCAN/KD-Tree,
-    preventing over-fragmentation that penalizes Panoptic Quality (PQ).
-    """
-    num_cc, labels_cc, stats, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=8)
-    if num_cc <= 1:
-        return []
-
-    valid_ids = [i for i in range(1, num_cc) if stats[i, cv2.CC_STAT_AREA] >= 12]
-    if not valid_ids:
-        return []
-
-    comp_contours = []
-    comp_areas = {}
-    for cid in valid_ids:
-        comp_mask = (labels_cc == cid).astype(np.uint8)
-        cnts, _ = cv2.findContours(comp_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-        pts = np.vstack([c.reshape(-1, 2) for c in cnts]) if cnts else np.argwhere(comp_mask > 0)[:, ::-1]
-        comp_contours.append((cid, pts))
-        comp_areas[cid] = int(stats[cid, cv2.CC_STAT_AREA])
-
-    parent = {cid: cid for cid in valid_ids}
-
-    def find(i):
-        while parent[i] != i:
-            parent[i] = parent[parent[i]]
-            i = parent[i]
-        return i
-
-    def union(i, j):
-        ri, rj = find(i), find(j)
-        if ri != rj:
-            parent[ri] = rj
-
-    trees = {cid: cKDTree(pts) for cid, pts in comp_contours}
-    for idx_a in range(len(comp_contours)):
-        cid_a, pts_a = comp_contours[idx_a]
-        for idx_b in range(idx_a + 1, len(comp_contours)):
-            cid_b, pts_b = comp_contours[idx_b]
-            if find(cid_a) == find(cid_b):
-                continue
-            ax, ay, aw, ah = stats[cid_a, :4]
-            bx, by, bw, bh = stats[cid_b, :4]
-            if (ax > bx + bw + eps) or (bx > ax + aw + eps) or (ay > by + bh + eps) or (by > ay + ah + eps):
-                continue
-            dists, _ = trees[cid_b].query(pts_a, k=1, distance_upper_bound=eps)
-            if np.any(np.isfinite(dists)):
-                union(cid_a, cid_b)
-
-    clusters = {}
-    for cid in valid_ids:
-        root = find(cid)
-        clusters.setdefault(root, []).append(cid)
-
-    min_cluster_area = max(int(min_pts), int(min_area))
+def split_instances_with_intelligence(foreground, boundary, spine, seed, uncertainty, min_area):
+    """Split only foreground components with multiple reliable learned markers."""
+    mask = fill_fragment_holes((foreground > Config.THRESHOLD).astype(np.uint8))
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     instances = []
-    for cids in clusters.values():
-        total_area = sum(comp_areas[c] for c in cids)
-        if total_area >= min_cluster_area:
-            inst_mask = np.isin(labels_cc, cids).astype(np.uint8)
-            instances.append(inst_mask)
+    for label in range(1, count):
+        component = (labels == label).astype(np.uint8)
+        if stats[label, cv2.CC_STAT_AREA] < min_area:
+            continue
+        markers_binary = ((seed >= Config.SEED_THRESHOLD) & (spine >= Config.SPINE_THRESHOLD) &
+                          (boundary < Config.BOUNDARY_THRESHOLD) & (uncertainty < Config.UNCERTAINTY_THRESHOLD) &
+                          (component > 0)).astype(np.uint8)
+        marker_count, marker_labels, marker_stats, _ = cv2.connectedComponentsWithStats(markers_binary, connectivity=8)
+        valid_markers = [i for i in range(1, marker_count) if marker_stats[i, cv2.CC_STAT_AREA] >= Config.MIN_SEED_AREA]
+        if len(valid_markers) < 2:
+            instances.append(component)
+            continue
+        y, x = np.where(component)
+        y0, y1 = max(0, y.min() - 1), min(component.shape[0], y.max() + 2)
+        x0, x1 = max(0, x.min() - 1), min(component.shape[1], x.max() + 2)
+        local_component = component[y0:y1, x0:x1]
+        markers = np.ones(local_component.shape, dtype=np.int32)
+        markers[local_component > 0] = 0
+        for marker_id, seed_id in enumerate(valid_markers, start=2):
+            markers[marker_labels[y0:y1, x0:x1] == seed_id] = marker_id
+        surface = np.clip((1.0 - foreground[y0:y1, x0:x1]) + boundary[y0:y1, x0:x1] +
+                          0.25 * uncertainty[y0:y1, x0:x1], 0.0, 1.0)
+        watershed = cv2.watershed(np.repeat((surface * 255).astype(np.uint8)[..., None], 3, axis=2), markers)
+        children = []
+        for marker_id in range(2, 2 + len(valid_markers)):
+            child = np.zeros_like(component)
+            child[y0:y1, x0:x1] = ((watershed == marker_id) & (local_component > 0)).astype(np.uint8)
+            if child.sum() >= min_area:
+                children.append(child)
+        instances.extend(children if len(children) >= 2 else [component])
     return instances
 
 
-def postprocess_probability_v6(
-    probability,
+def postprocess_probability_v7(
+    probabilities,
     img_limb_2048=None,
-    threshold=Config.THRESHOLD,
     min_area=Config.MIN_AREA,
-    use_dbscan=Config.USE_DBSCAN,
 ):
-    """
-    3-stage mandatory post-processing cascade:
-    1. 2K DenseCRF boundary refinement
-    2. Thresholding + OpenCV Hole Filling
-    3. DBSCAN fragment integration for Panoptic Quality (PQ)
-    """
-    if isinstance(probability, torch.Tensor):
-        prob_2k = probability.detach().float().cpu().numpy().squeeze()
-    else:
-        prob_2k = np.asarray(probability, dtype=np.float32).squeeze()
-
+    """Mandatory DenseCRF followed by learned boundary/seed-aware instance decoding."""
     if img_limb_2048 is None:
         raise ValueError('DenseCRF requires the native limb-corrected image.')
-    prob_2k = apply_densecrf_2k(prob_2k, img_limb_2048)
-
-    mask_u8 = (prob_2k > threshold).astype(np.uint8)
-    mask_u8 = fill_fragment_holes(mask_u8)
-
-    if use_dbscan:
-        return cluster_fragments_dbscan(mask_u8, eps=Config.DBSCAN_EPS, min_pts=Config.DBSCAN_MIN_PTS, min_area=min_area)
-
-    num_cc, labels_cc, stats, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=8)
-    return [
-        (labels_cc == i).astype(np.uint8)
-        for i in range(1, num_cc)
-        if stats[i, cv2.CC_STAT_AREA] >= min_area
-    ]
+    foreground = apply_densecrf_2k(probabilities['foreground'], img_limb_2048)
+    return split_instances_with_intelligence(foreground, probabilities['boundary'], probabilities['spine'],
+                                             probabilities['seed'], probabilities['uncertainty'], min_area)
 
 
 def pycoco_rle_encode(img):
     """Encodes a binary mask to pycocotools RLE ASCII string."""
     rle = maskUtils.encode(np.asfortranarray(img.astype(np.uint8)))
     return rle['counts'].decode('utf-8')
+
+
+def predict_intelligence(model, img_path):
+    """Return the five native-resolution decision probabilities for one image."""
+    img = load_image(img_path)
+    prepared, limb = prepare_input_3ch(img)
+    tensor = torch.from_numpy(prepared).permute(2, 0, 1).unsqueeze(0).to(Config.DEVICE, non_blocking=True)
+    with torch.no_grad(), torch.autocast(device_type='cuda', dtype=Config.AMP_DTYPE):
+        outputs = model(tensor)
+    probabilities = {
+        name: torch.sigmoid(outputs[name]).squeeze().float().cpu().numpy()
+        for name in ('foreground', 'boundary', 'spine', 'seed', 'uncertainty')
+    }
+    return probabilities, limb
+
+
+def panoptic_metrics(predictions, targets):
+    """Canonical one-class PQ with strictly-greater-than-0.5 IoU matching."""
+    overlaps = np.zeros((len(predictions), len(targets)), dtype=np.float32)
+    for p, prediction in enumerate(predictions):
+        for t, target in enumerate(targets):
+            union = np.logical_or(prediction, target).sum()
+            overlaps[p, t] = np.logical_and(prediction, target).sum() / max(union, 1)
+    matched_predictions, matched_targets, matched_iou = set(), set(), []
+    for iou, p, t in sorted(((overlaps[p, t], p, t) for p in range(len(predictions)) for t in range(len(targets))), reverse=True):
+        if iou <= Config.PQ_IOU_THRESHOLD or p in matched_predictions or t in matched_targets:
+            continue
+        matched_predictions.add(p)
+        matched_targets.add(t)
+        matched_iou.append(float(iou))
+    tp = len(matched_iou)
+    fp, fn = len(predictions) - tp, len(targets) - tp
+    nonzero = overlaps > 0
+    return {
+        'sum_iou': sum(matched_iou), 'tp': tp, 'fp': fp, 'fn': fn,
+        'splits': int(np.maximum(nonzero.sum(axis=0) - 1, 0).sum()),
+        'merges': int(np.maximum(nonzero.sum(axis=1) - 1, 0).sum()),
+    }
+
+
+def evaluate_panoptic(model, coco, records_by_filename, file_names):
+    """Evaluate every physical image prediction against every available annotation pass."""
+    totals = defaultdict(float)
+    for file_name in tqdm(file_names, desc='Validating PQ'):
+        probabilities, limb = predict_intelligence(model, os.path.join(Config.TRAIN_DIR, file_name))
+        predictions = postprocess_probability_v7(probabilities, limb)
+        for image_id in records_by_filename[file_name]:
+            targets = [(coco.annToMask(ann) > 0).astype(np.uint8) for ann in coco.imgToAnns.get(image_id, [])]
+            for key, value in panoptic_metrics(predictions, targets).items():
+                totals[key] += value
+    denominator = totals['tp'] + 0.5 * totals['fp'] + 0.5 * totals['fn']
+    pq = totals['sum_iou'] / denominator if denominator else 0.0
+    return {
+        'pq': pq,
+        'sq': totals['sum_iou'] / totals['tp'] if totals['tp'] else 0.0,
+        'rq': totals['tp'] / denominator if denominator else 0.0,
+        **totals,
+    }
 
 
 def generate_submission(model, test_paths, out_path):
@@ -956,24 +1029,12 @@ def generate_submission(model, test_paths, out_path):
     with torch.no_grad():
         for img_path in tqdm(test_paths, desc="Generating Submission"):
             base_id = os.path.basename(img_path).split('.')[0]
-            img = load_image(img_path)
+            probabilities, img_limb_2048 = predict_intelligence(model, img_path)
 
-            prepared_3ch, img_limb_2048 = prepare_input_3ch(img)
-            if prepared_3ch.shape[:2] != (Config.IMG_SIZE, Config.IMG_SIZE):
-                raise ValueError(f'Expected {Config.IMG_SIZE}x{Config.IMG_SIZE} image, got {prepared_3ch.shape[:2]}.')
-            tensor = torch.from_numpy(prepared_3ch).permute(2, 0, 1).unsqueeze(0).to(Config.DEVICE, non_blocking=True)
-
-            with torch.autocast(device_type='cuda', dtype=Config.AMP_DTYPE):
-                logits = model(tensor)
-
-            prob_2048 = torch.sigmoid(logits).squeeze()
-
-            instances = postprocess_probability_v6(
-                prob_2048,
+            instances = postprocess_probability_v7(
+                probabilities,
                 img_limb_2048=img_limb_2048,
-                threshold=Config.THRESHOLD,
                 min_area=Config.MIN_AREA,
-                use_dbscan=Config.USE_DBSCAN
             )
 
             for i, inst_mask in enumerate(instances, start=1):
@@ -1029,23 +1090,28 @@ def main():
             f'{len(missing_train_images)} COCO image entries are missing from {Config.TRAIN_DIR}: {preview}'
         )
 
-    valid_img_ids = all_img_ids
+    records_by_filename = defaultdict(list)
+    for image_id in all_img_ids:
+        records_by_filename[coco.imgs[image_id]['file_name']].append(image_id)
+    physical_files = sorted(records_by_filename)
 
-    print(f"Valid training images on disk: {len(valid_img_ids)}")
+    print(f"Valid training images on disk: {len(physical_files)} physical observations")
     print(f"Total ground truth annotations: {len(coco.dataset.get('annotations', []))}")
 
-    # 2. Train / Val Split (80 / 20)
+    # 2. Group-safe Train / Development / Audit Split by physical filename.
     random.seed(Config.SEED)
-    random.shuffle(valid_img_ids)
-    split_idx = int(0.8 * len(valid_img_ids))
-    train_ids = valid_img_ids[:split_idx]
-    val_ids = valid_img_ids[split_idx:]
+    random.shuffle(physical_files)
+    train_end = int(0.8 * len(physical_files))
+    dev_end = int(0.9 * len(physical_files))
+    train_files = physical_files[:train_end]
+    dev_files = physical_files[train_end:dev_end]
+    audit_files = physical_files[dev_end:]
 
-    print(f"Training images: {len(train_ids)} | Validation images: {len(val_ids)}")
+    print(f"Training: {len(train_files)} | Development: {len(dev_files)} | Audit: {len(audit_files)} physical images")
 
     # 3. Datasets and Loaders
-    train_ds = SolarDataset(coco, train_ids, Config.TRAIN_DIR, Config.IMG_SIZE, train_transforms)
-    val_ds = SolarDataset(coco, val_ids, Config.TRAIN_DIR, Config.IMG_SIZE, val_transforms)
+    train_ds = SolarDataset(coco, records_by_filename, train_files, Config.TRAIN_DIR, Config.IMG_SIZE, train_transforms, training=True)
+    val_ds = SolarDataset(coco, records_by_filename, dev_files, Config.TRAIN_DIR, Config.IMG_SIZE, val_transforms)
 
     train_loader = DataLoader(
         train_ds, batch_size=Config.BATCH_SIZE, shuffle=True,
@@ -1068,10 +1134,10 @@ def main():
     print(f"\nModel Parameters: {total_count:,} total, {trainable_count:,} trainable")
 
     optimizer = torch.optim.AdamW(trainable_params, lr=Config.LR, weight_decay=Config.WEIGHT_DECAY)
-    criterion = DiceBCELoss()
+    criterion = IntelligenceLoss()
 
-    # 6. Training Loop with Early Best Model Saving
-    best_loss = float('inf')
+    # 6. Training Loop with PQ-based model selection.
+    best_pq = float('-inf')
     model_path = os.path.join(Config.OUT_DIR, 'best_model.pth')
 
     for epoch in range(1, Config.EPOCHS + 1):
@@ -1079,20 +1145,25 @@ def main():
         print(f"Epoch {epoch}/{Config.EPOCHS}")
         print(f"{'='*40}")
 
-        train_loss = train_epoch(model, train_loader, optimizer, criterion, epoch=epoch)
-        val_loss = validate(model, val_loader, criterion, epoch=epoch)
+        train_metrics = train_epoch(model, train_loader, optimizer, criterion, epoch=epoch)
+        val_metrics = validate(model, val_loader, criterion, epoch=epoch)
+        pq_metrics = evaluate_panoptic(model, coco, records_by_filename, dev_files)
 
-        print(f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+        print(f"Train Total: {train_metrics['total']:.4f} | Val Total: {val_metrics['total']:.4f} | "
+              f"PQ: {pq_metrics['pq']:.4f} | SQ: {pq_metrics['sq']:.4f} | RQ: {pq_metrics['rq']:.4f} | "
+              f"splits: {int(pq_metrics['splits'])} | merges: {int(pq_metrics['merges'])}")
 
-        if val_loss < best_loss:
-            best_loss = val_loss
+        if pq_metrics['pq'] > best_pq:
+            best_pq = pq_metrics['pq']
             torch.save(base_model(model).state_dict(), model_path)
-            print(f"✓ Saved new best model checkpoint! (val_loss: {val_loss:.4f})")
+            print(f"✓ Saved new best model checkpoint! (development PQ: {best_pq:.4f})")
 
     # 7. Generate Submission on Test Images
     print("\n" + "=" * 60)
     print("Loading best checkpoint for Kaggle submission...")
     base_model(model).load_state_dict(torch.load(model_path, map_location=Config.DEVICE, weights_only=True))
+    audit_metrics = evaluate_panoptic(model, coco, records_by_filename, audit_files)
+    print(f"Frozen audit PQ: {audit_metrics['pq']:.4f} | SQ: {audit_metrics['sq']:.4f} | RQ: {audit_metrics['rq']:.4f}")
 
     test_imgs = sorted(glob.glob(os.path.join(Config.TEST_DIR, '*.jpeg')))
     print(f"Found {len(test_imgs)} test images.")

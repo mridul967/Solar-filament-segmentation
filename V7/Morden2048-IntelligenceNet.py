@@ -44,12 +44,8 @@ from albumentations.pytorch import ToTensorV2
 from pycocotools.coco import COCO
 from pycocotools import mask as maskUtils
 
-# Optional CRF tools with safe fallbacks
-try:
-    import pydensecrf.densecrf as dcrf
-    from pydensecrf.utils import unary_from_softmax
-except ImportError:
-    dcrf = None
+import pydensecrf.densecrf as dcrf
+from pydensecrf.utils import unary_from_softmax
 
 from sklearn.cluster import DBSCAN
 from scipy.spatial import cKDTree
@@ -115,7 +111,6 @@ class Config:
     MIN_AREA = 200        # Minimum pixel area filtering out granulation noise
     
     # 2K DenseCRF Settings
-    USE_DENSECRF = True
     CRF_W1 = 40.0
     CRF_W2 = 3.0
     CRF_THETA_ALPHA_SQ = 8.0   # Bilateral spatial std^2
@@ -810,22 +805,10 @@ def validate(model, loader, criterion, epoch=1):
 # CELL 8: Post-Processing Cascade (DenseCRF -> Hole Filling -> DBSCAN) & Submission
 
 def apply_densecrf_2k(prob_2k, img_limb_2k):
-    """
-    Applies DenseCRF at 2048x2048 using Table 3 parameters from Hu et al. (2026).
-    Falls back to edge-preserving bilateral filtering if pydensecrf is unavailable.
-    """
+    """Applies mandatory DenseCRF boundary refinement at 2048x2048."""
     H, W = prob_2k.shape
     prob_fg = np.clip(prob_2k.astype(np.float32), 1e-6, 1.0 - 1e-6)
     img_u8 = np.clip(img_limb_2k * 255.0, 0, 255).astype(np.uint8)
-
-    if dcrf is None:
-        guide_f = img_u8.astype(np.float32) / 255.0
-        smoothed = cv2.bilateralFilter(prob_fg, d=7, sigmaColor=0.10, sigmaSpace=3.0)
-        grad_x = cv2.Sobel(guide_f, cv2.CV_32F, 1, 0, ksize=3)
-        grad_y = cv2.Sobel(guide_f, cv2.CV_32F, 0, 1, ksize=3)
-        grad_mag = np.sqrt(grad_x ** 2 + grad_y ** 2)
-        grad_norm = grad_mag / (grad_mag.max() + 1e-6)
-        return np.clip(smoothed - 0.05 * grad_norm * (0.5 - smoothed), 0.0, 1.0)
 
     softmax_probs = np.stack([1.0 - prob_fg, prob_fg], axis=0)
     unary = unary_from_softmax(softmax_probs)
@@ -928,11 +911,10 @@ def postprocess_probability_v6(
     img_limb_2048=None,
     threshold=Config.THRESHOLD,
     min_area=Config.MIN_AREA,
-    use_densecrf=Config.USE_DENSECRF,
     use_dbscan=Config.USE_DBSCAN,
 ):
     """
-    3-stage post-processing cascade:
+    3-stage mandatory post-processing cascade:
     1. 2K DenseCRF boundary refinement
     2. Thresholding + OpenCV Hole Filling
     3. DBSCAN fragment integration for Panoptic Quality (PQ)
@@ -942,8 +924,9 @@ def postprocess_probability_v6(
     else:
         prob_2k = np.asarray(probability, dtype=np.float32).squeeze()
 
-    if use_densecrf and img_limb_2048 is not None:
-        prob_2k = apply_densecrf_2k(prob_2k, img_limb_2048)
+    if img_limb_2048 is None:
+        raise ValueError('DenseCRF requires the native limb-corrected image.')
+    prob_2k = apply_densecrf_2k(prob_2k, img_limb_2048)
 
     mask_u8 = (prob_2k > threshold).astype(np.uint8)
     mask_u8 = fill_fragment_holes(mask_u8)
@@ -990,7 +973,6 @@ def generate_submission(model, test_paths, out_path):
                 img_limb_2048=img_limb_2048,
                 threshold=Config.THRESHOLD,
                 min_area=Config.MIN_AREA,
-                use_densecrf=Config.USE_DENSECRF,
                 use_dbscan=Config.USE_DBSCAN
             )
 

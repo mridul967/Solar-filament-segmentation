@@ -107,6 +107,7 @@ class Config:
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
     AMP_DTYPE = torch.bfloat16
     COMPILE_MODE = 'max-autotune'
+    METRICS_FILE = 'v7_training_metrics.csv'
 
     # === POST-PROCESSING & SUBMISSION HYPERPARAMETERS ===
     THRESHOLD = 0.40      # Base probability threshold
@@ -994,10 +995,16 @@ def panoptic_metrics(predictions, targets):
     tp = len(matched_iou)
     fp, fn = len(predictions) - tp, len(targets) - tp
     nonzero = overlaps > 0
+    pred_foreground = np.logical_or.reduce(predictions) if predictions else np.zeros_like(targets[0]) if targets else np.zeros((Config.ORIGINAL_SIZE, Config.ORIGINAL_SIZE), dtype=np.uint8)
+    gt_foreground = np.logical_or.reduce(targets) if targets else np.zeros_like(pred_foreground)
     return {
         'sum_iou': sum(matched_iou), 'tp': tp, 'fp': fp, 'fn': fn,
+        'pred_instances': len(predictions), 'gt_instances': len(targets),
         'splits': int(np.maximum(nonzero.sum(axis=0) - 1, 0).sum()),
         'merges': int(np.maximum(nonzero.sum(axis=1) - 1, 0).sum()),
+        'foreground_intersection': int(np.logical_and(pred_foreground, gt_foreground).sum()),
+        'pred_foreground_pixels': int(pred_foreground.sum()),
+        'gt_foreground_pixels': int(gt_foreground.sum()),
     }
 
 
@@ -1013,10 +1020,16 @@ def evaluate_panoptic(model, coco, records_by_filename, file_names):
                 totals[key] += value
     denominator = totals['tp'] + 0.5 * totals['fp'] + 0.5 * totals['fn']
     pq = totals['sum_iou'] / denominator if denominator else 0.0
+    dice_denominator = totals['pred_foreground_pixels'] + totals['gt_foreground_pixels']
     return {
         'pq': pq,
         'sq': totals['sum_iou'] / totals['tp'] if totals['tp'] else 0.0,
         'rq': totals['tp'] / denominator if denominator else 0.0,
+        'dice': 2.0 * totals['foreground_intersection'] / dice_denominator if dice_denominator else 0.0,
+        'fragmentation_rate': totals['splits'] / totals['gt_instances'] if totals['gt_instances'] else 0.0,
+        'overmerge_rate': totals['merges'] / totals['pred_instances'] if totals['pred_instances'] else 0.0,
+        'false_positive_rate': totals['fp'] / (totals['tp'] + totals['fp']) if totals['tp'] + totals['fp'] else 0.0,
+        'false_negative_rate': totals['fn'] / (totals['tp'] + totals['fn']) if totals['tp'] + totals['fn'] else 0.0,
         **totals,
     }
 
@@ -1139,6 +1152,8 @@ def main():
     # 6. Training Loop with PQ-based model selection.
     best_pq = float('-inf')
     model_path = os.path.join(Config.OUT_DIR, 'best_model.pth')
+    metrics_path = os.path.join(Config.OUT_DIR, Config.METRICS_FILE)
+    metric_history = []
 
     for epoch in range(1, Config.EPOCHS + 1):
         print(f"\n{'='*40}")
@@ -1151,7 +1166,17 @@ def main():
 
         print(f"Train Total: {train_metrics['total']:.4f} | Val Total: {val_metrics['total']:.4f} | "
               f"PQ: {pq_metrics['pq']:.4f} | SQ: {pq_metrics['sq']:.4f} | RQ: {pq_metrics['rq']:.4f} | "
-              f"splits: {int(pq_metrics['splits'])} | merges: {int(pq_metrics['merges'])}")
+              f"Dice: {pq_metrics['dice']:.4f} | split rate: {pq_metrics['fragmentation_rate']:.4f} | "
+              f"merge rate: {pq_metrics['overmerge_rate']:.4f} | FP rate: {pq_metrics['false_positive_rate']:.4f} | "
+              f"FN rate: {pq_metrics['false_negative_rate']:.4f}")
+
+        metric_history.append({
+            'epoch': epoch, 'split': 'development',
+            **{f'train_{key}': value for key, value in train_metrics.items()},
+            **{f'validation_{key}': value for key, value in val_metrics.items()},
+            **pq_metrics,
+        })
+        pd.DataFrame(metric_history).to_csv(metrics_path, index=False)
 
         if pq_metrics['pq'] > best_pq:
             best_pq = pq_metrics['pq']
@@ -1163,7 +1188,10 @@ def main():
     print("Loading best checkpoint for Kaggle submission...")
     base_model(model).load_state_dict(torch.load(model_path, map_location=Config.DEVICE, weights_only=True))
     audit_metrics = evaluate_panoptic(model, coco, records_by_filename, audit_files)
-    print(f"Frozen audit PQ: {audit_metrics['pq']:.4f} | SQ: {audit_metrics['sq']:.4f} | RQ: {audit_metrics['rq']:.4f}")
+    metric_history.append({'epoch': 'best', 'split': 'audit', **audit_metrics})
+    pd.DataFrame(metric_history).to_csv(metrics_path, index=False)
+    print(f"Frozen audit PQ: {audit_metrics['pq']:.4f} | SQ: {audit_metrics['sq']:.4f} | RQ: {audit_metrics['rq']:.4f} | "
+          f"Dice: {audit_metrics['dice']:.4f}")
 
     test_imgs = sorted(glob.glob(os.path.join(Config.TEST_DIR, '*.jpeg')))
     print(f"Found {len(test_imgs)} test images.")

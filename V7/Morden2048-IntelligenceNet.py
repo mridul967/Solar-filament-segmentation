@@ -898,18 +898,9 @@ def apply_densecrf_2k(prob_2k, img_limb_2k):
     return np.asarray(Q, dtype=np.float32)[1].reshape((H, W))
 
 
-def fill_fragment_holes(mask_u8):
-    """Fills internal holes to ensure each filament is a simply connected domain."""
-    contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-    filled = np.zeros_like(mask_u8, dtype=np.uint8)
-    if contours:
-        cv2.drawContours(filled, contours, -1, color=1, thickness=cv2.FILLED)
-    return filled
-
-
 def split_instances_with_intelligence(foreground, boundary, spine, seed, uncertainty, min_area):
     """Split only foreground components with multiple reliable learned markers."""
-    mask = fill_fragment_holes((foreground > Config.THRESHOLD).astype(np.uint8))
+    mask = (foreground > Config.THRESHOLD).astype(np.uint8)
     count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     instances = []
     for label in range(1, count):

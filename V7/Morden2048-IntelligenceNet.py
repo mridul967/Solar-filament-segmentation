@@ -137,10 +137,20 @@ print(f"Annotations exist: {os.path.exists(Config.ANNOTATIONS_FILE)}")
 # CELL 3: Physics-Grounded Preprocessing Engine
 
 def load_image(path):
-    """Load image handling both 16-bit and 8-bit formats."""
-    img = cv2.imread(path, cv2.IMREAD_ANYDEPTH)
+    """Load one valid native-resolution MAGFiLO image without synthetic fallbacks."""
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f'MAGFiLO image is missing: {path}')
+
+    img = cv2.imread(path, cv2.IMREAD_ANYDEPTH | cv2.IMREAD_GRAYSCALE)
     if img is None:
-        img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        raise ValueError(f'MAGFiLO image cannot be decoded: {path}')
+    if img.ndim != 2:
+        raise ValueError(f'MAGFiLO image must be single-channel, got shape {img.shape}: {path}')
+    if img.shape != (Config.ORIGINAL_SIZE, Config.ORIGINAL_SIZE):
+        raise ValueError(
+            f'MAGFiLO image must be {Config.ORIGINAL_SIZE}x{Config.ORIGINAL_SIZE}, '
+            f'got {img.shape}: {path}'
+        )
     return img
 
 
@@ -274,8 +284,6 @@ class SolarDataset(Dataset):
         img_path = os.path.join(self.img_dir, file_name)
 
         img = load_image(img_path)
-        if img is None:
-            img = np.random.randint(0, 65535, (2048, 2048), dtype=np.uint16)
 
         # 3-channel physics tensor
         img_3ch, _ = prepare_input_3ch(img)
@@ -966,8 +974,6 @@ def generate_submission(model, test_paths, out_path):
         for img_path in tqdm(test_paths, desc="Generating Submission"):
             base_id = os.path.basename(img_path).split('.')[0]
             img = load_image(img_path)
-            if img is None:
-                img = np.random.randint(0, 65535, (2048, 2048), dtype=np.uint16)
 
             prepared_3ch, img_limb_2048 = prepare_input_3ch(img)
             if prepared_3ch.shape[:2] != (Config.IMG_SIZE, Config.IMG_SIZE):
@@ -1019,12 +1025,29 @@ def main():
     all_img_ids = list(coco.imgs.keys())
     print(f"Total images in JSON: {len(all_img_ids)}")
 
-    valid_img_ids = []
+    orphan_annotation_ids = sorted({
+        ann['image_id']
+        for ann in coco.dataset.get('annotations', [])
+        if ann['image_id'] not in coco.imgs
+    })
+    if orphan_annotation_ids:
+        preview = ', '.join(map(str, orphan_annotation_ids[:10]))
+        raise ValueError(f'Annotations reference image IDs absent from the COCO images registry: {preview}')
+
+    missing_train_images = []
     for img_id in all_img_ids:
         file_name = coco.imgs[img_id]['file_name']
         img_path = os.path.join(Config.TRAIN_DIR, file_name)
-        if os.path.exists(img_path):
-            valid_img_ids.append(img_id)
+        if not os.path.isfile(img_path):
+            missing_train_images.append(file_name)
+
+    if missing_train_images:
+        preview = ', '.join(missing_train_images[:10])
+        raise FileNotFoundError(
+            f'{len(missing_train_images)} COCO image entries are missing from {Config.TRAIN_DIR}: {preview}'
+        )
+
+    valid_img_ids = all_img_ids
 
     print(f"Valid training images on disk: {len(valid_img_ids)}")
     print(f"Total ground truth annotations: {len(coco.dataset.get('annotations', []))}")

@@ -978,6 +978,12 @@ def pycoco_rle_encode(img):
     return rle['counts'].decode('utf-8')
 
 
+def assert_rle_round_trip(mask, rle_string):
+    decoded = maskUtils.decode({'size': list(mask.shape), 'counts': rle_string.encode('utf-8')})
+    if not np.array_equal(decoded.astype(np.uint8), mask.astype(np.uint8)):
+        raise ValueError('Submission RLE does not round-trip through pycocotools.')
+
+
 def predict_intelligence(model, img_path):
     """Return the five native-resolution decision probabilities for one image."""
     img = load_image(img_path)
@@ -992,39 +998,58 @@ def predict_intelligence(model, img_path):
     return probabilities, limb
 
 
+def get_overlap_matrices(gt_layers, pred_layers):
+    """Exact in-memory counterpart of the Kaggle self-evaluation notebook."""
+    n_gt, height, width = gt_layers.shape
+    n_pred = pred_layers.shape[0]
+    gt_flat = torch.from_numpy(gt_layers.astype(np.float32, copy=False)).reshape(n_gt, height * width)
+    pred_flat = torch.from_numpy(pred_layers.astype(np.float32, copy=False)).reshape(n_pred, height * width)
+    intersection = torch.matmul(gt_flat, pred_flat.t())
+    gt_areas = gt_flat.sum(dim=1).view(-1, 1)
+    pred_areas = pred_flat.sum(dim=1).view(1, -1)
+    union = gt_areas + pred_areas - intersection
+    iou = torch.where(union == 0, torch.tensor(0.0), intersection / union)
+    dice = torch.where(union == 0, torch.tensor(0.0), 2.0 * intersection / (gt_areas + pred_areas))
+    return iou, dice
+
+
 def panoptic_metrics(predictions, targets):
-    """Canonical one-class PQ with strictly-greater-than-0.5 IoU matching."""
-    overlaps = np.zeros((len(predictions), len(targets)), dtype=np.float32)
-    for p, prediction in enumerate(predictions):
-        for t, target in enumerate(targets):
-            union = np.logical_or(prediction, target).sum()
-            overlaps[p, t] = np.logical_and(prediction, target).sum() / max(union, 1)
-    matched_predictions, matched_targets, matched_iou = set(), set(), []
-    for iou, p, t in sorted(((overlaps[p, t], p, t) for p in range(len(predictions)) for t in range(len(targets))), reverse=True):
-        if iou <= Config.PQ_IOU_THRESHOLD or p in matched_predictions or t in matched_targets:
-            continue
-        matched_predictions.add(p)
-        matched_targets.add(t)
-        matched_iou.append(float(iou))
-    tp = len(matched_iou)
-    fp, fn = len(predictions) - tp, len(targets) - tp
-    nonzero = overlaps > 0
-    pred_foreground = np.logical_or.reduce(predictions) if predictions else np.zeros_like(targets[0]) if targets else np.zeros((Config.ORIGINAL_SIZE, Config.ORIGINAL_SIZE), dtype=np.uint8)
-    gt_foreground = np.logical_or.reduce(targets) if targets else np.zeros_like(pred_foreground)
+    """Metric-identical matching and FP/FN accounting to Kaggle's self-evaluator."""
+    shape = (Config.ORIGINAL_SIZE, Config.ORIGINAL_SIZE)
+    gt_layers = np.stack(targets).astype(np.float32) if targets else np.zeros((0, *shape), dtype=np.float32)
+    pred_layers = np.stack(predictions).astype(np.float32) if predictions else np.zeros((0, *shape), dtype=np.float32)
+    iou, dice = get_overlap_matrices(gt_layers, pred_layers)
+    hit = iou > Config.PQ_IOU_THRESHOLD
+    matched_iou = iou[hit].tolist()
+    matched_dice = dice[hit].tolist()
+    gt_degree = hit.sum(dim=1).numpy() if len(targets) else np.zeros(0, dtype=np.int64)
+    pred_degree = hit.sum(dim=0).numpy() if len(predictions) else np.zeros(0, dtype=np.int64)
+    fp = int((pred_degree == 0).sum())
+    fn = int((gt_degree == 0).sum())
+    pred_foreground = np.logical_or.reduce(predictions) if predictions else np.zeros(shape, dtype=np.uint8)
+    gt_foreground = np.logical_or.reduce(targets) if targets else np.zeros(shape, dtype=np.uint8)
+    positive_iou = iou[iou > 0].tolist()
+    positive_dice = dice[dice > 0].tolist()
     return {
-        'sum_iou': sum(matched_iou), 'tp': tp, 'fp': fp, 'fn': fn,
+        'sum_iou': sum(matched_iou), 'tp': len(matched_iou), 'fp': fp, 'fn': fn,
         'pred_instances': len(predictions), 'gt_instances': len(targets),
-        'splits': int(np.maximum(nonzero.sum(axis=0) - 1, 0).sum()),
-        'merges': int(np.maximum(nonzero.sum(axis=1) - 1, 0).sum()),
+        'splits': int(np.maximum(gt_degree - 1, 0).sum()),
+        'merges': int(np.maximum(pred_degree - 1, 0).sum()),
+        'gt_miss_count': int((gt_degree == 0).sum()), 'pred_miss_count': int((pred_degree == 0).sum()),
+        'gt_multi_count': int((gt_degree > 1).sum()), 'pred_multi_count': int((pred_degree > 1).sum()),
         'foreground_intersection': int(np.logical_and(pred_foreground, gt_foreground).sum()),
-        'pred_foreground_pixels': int(pred_foreground.sum()),
-        'gt_foreground_pixels': int(gt_foreground.sum()),
+        'pred_foreground_pixels': int(pred_foreground.sum()), 'gt_foreground_pixels': int(gt_foreground.sum()),
+        '_positive_iou': positive_iou, '_positive_dice': positive_dice, '_matched_dice': matched_dice,
     }
 
 
 def summarize_panoptic(totals):
     denominator = totals['tp'] + 0.5 * totals['fp'] + 0.5 * totals['fn']
     dice_denominator = totals['pred_foreground_pixels'] + totals['gt_foreground_pixels']
+    positive_iou = totals.get('_positive_iou', [])
+    positive_dice = totals.get('_positive_dice', [])
+    matched_dice = totals.get('_matched_dice', [])
+    numeric_totals = {key: value for key, value in totals.items() if not key.startswith('_')}
     return {
         'pq': totals['sum_iou'] / denominator if denominator else 0.0,
         'sq': totals['sum_iou'] / totals['tp'] if totals['tp'] else 0.0,
@@ -1034,7 +1059,16 @@ def summarize_panoptic(totals):
         'overmerge_rate': totals['merges'] / totals['pred_instances'] if totals['pred_instances'] else 0.0,
         'false_positive_rate': totals['fp'] / (totals['tp'] + totals['fp']) if totals['tp'] + totals['fp'] else 0.0,
         'false_negative_rate': totals['fn'] / (totals['tp'] + totals['fn']) if totals['tp'] + totals['fn'] else 0.0,
-        **totals,
+        'gt_miss_rate': totals['gt_miss_count'] / totals['gt_instances'] if totals['gt_instances'] else 0.0,
+        'pred_miss_rate': totals['pred_miss_count'] / totals['pred_instances'] if totals['pred_instances'] else 0.0,
+        'one_to_many_rate': totals['gt_multi_count'] / totals['gt_instances'] if totals['gt_instances'] else 0.0,
+        'many_to_one_rate': totals['pred_multi_count'] / totals['pred_instances'] if totals['pred_instances'] else 0.0,
+        'pair_iou_mean': float(np.mean(positive_iou)) if positive_iou else 0.0,
+        'pair_iou_median': float(np.median(positive_iou)) if positive_iou else 0.0,
+        'pair_dice_mean': float(np.mean(positive_dice)) if positive_dice else 0.0,
+        'pair_dice_median': float(np.median(positive_dice)) if positive_dice else 0.0,
+        'matched_dice_mean': float(np.mean(matched_dice)) if matched_dice else 0.0,
+        **numeric_totals,
     }
 
 
@@ -1042,7 +1076,10 @@ def accumulate_pass_metrics(totals, predictions, coco, image_ids):
     for image_id in image_ids:
         targets = [(coco.annToMask(ann) > 0).astype(np.uint8) for ann in coco.imgToAnns.get(image_id, [])]
         for key, value in panoptic_metrics(predictions, targets).items():
-            totals[key] += value
+            if key.startswith('_'):
+                totals.setdefault(key, []).extend(value)
+            else:
+                totals[key] += value
 
 
 def evaluate_panoptic(model, coco, records_by_filename, file_names, settings=DecoderSettings()):
@@ -1181,6 +1218,8 @@ def generate_submission(model, test_paths, out_path, settings):
     with torch.no_grad():
         for img_path in tqdm(test_paths, desc="Generating Submission"):
             base_id = os.path.basename(img_path).split('.')[0]
+            if '_' in base_id:
+                raise ValueError(f'Image ID contains an underscore and is incompatible with Kaggle self-eval parsing: {base_id}')
             probabilities, img_limb_2048 = predict_intelligence(model, img_path)
 
             instances = postprocess_probability_v7(
@@ -1191,6 +1230,7 @@ def generate_submission(model, test_paths, out_path, settings):
 
             for i, inst_mask in enumerate(instances, start=1):
                 rle_str = pycoco_rle_encode(inst_mask)
+                assert_rle_round_trip(inst_mask, rle_str)
                 fil_id = f"{base_id}_{i}"
                 submissions.append({
                     'filament_id': fil_id,

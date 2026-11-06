@@ -14,10 +14,13 @@
 import os
 import sys
 import glob
+import hashlib
+import json
 import math
 import time
 import random
 from collections import defaultdict
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 # Must be set before importing torch to reduce memory allocator fragmentation
@@ -103,11 +106,13 @@ class Config:
     EPOCHS = 25
     LR = 2e-4             # AdamW learning rate
     WEIGHT_DECAY = 1e-4   # L2 Regularization
-    NUM_WORKERS = 2
+    NUM_WORKERS = 4
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
     AMP_DTYPE = torch.bfloat16
     COMPILE_MODE = 'max-autotune'
     METRICS_FILE = 'v7_training_metrics.csv'
+    DECODER_CACHE_DIR = 'v7_decoder_cache'
+    DECODER_SETTINGS_FILE = 'v7_decoder_settings.json'
 
     # === POST-PROCESSING & SUBMISSION HYPERPARAMETERS ===
     THRESHOLD = 0.40      # Base probability threshold
@@ -131,6 +136,17 @@ class Config:
 print(f"Train dir exists: {os.path.exists(Config.TRAIN_DIR)}")
 print(f"Test dir exists:  {os.path.exists(Config.TEST_DIR)}")
 print(f"Annotations exist: {os.path.exists(Config.ANNOTATIONS_FILE)}")
+
+
+@dataclass(frozen=True)
+class DecoderSettings:
+    foreground_threshold: float = Config.THRESHOLD
+    min_area: int = Config.MIN_AREA
+    boundary_threshold: float = Config.BOUNDARY_THRESHOLD
+    spine_threshold: float = Config.SPINE_THRESHOLD
+    seed_threshold: float = Config.SEED_THRESHOLD
+    uncertainty_threshold: float = Config.UNCERTAINTY_THRESHOLD
+    min_seed_area: int = Config.MIN_SEED_AREA
 
 
 # %% [code]
@@ -898,20 +914,20 @@ def apply_densecrf_2k(prob_2k, img_limb_2k):
     return np.asarray(Q, dtype=np.float32)[1].reshape((H, W))
 
 
-def split_instances_with_intelligence(foreground, boundary, spine, seed, uncertainty, min_area):
+def resolve_instances(densecrf_foreground, boundary, spine, seed, uncertainty, settings):
     """Split only foreground components with multiple reliable learned markers."""
-    mask = (foreground > Config.THRESHOLD).astype(np.uint8)
+    mask = (densecrf_foreground > settings.foreground_threshold).astype(np.uint8)
     count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     instances = []
     for label in range(1, count):
         component = (labels == label).astype(np.uint8)
-        if stats[label, cv2.CC_STAT_AREA] < min_area:
+        if stats[label, cv2.CC_STAT_AREA] < settings.min_area:
             continue
-        markers_binary = ((seed >= Config.SEED_THRESHOLD) & (spine >= Config.SPINE_THRESHOLD) &
-                          (boundary < Config.BOUNDARY_THRESHOLD) & (uncertainty < Config.UNCERTAINTY_THRESHOLD) &
+        markers_binary = ((seed >= settings.seed_threshold) & (spine >= settings.spine_threshold) &
+                          (boundary < settings.boundary_threshold) & (uncertainty < settings.uncertainty_threshold) &
                           (component > 0)).astype(np.uint8)
         marker_count, marker_labels, marker_stats, _ = cv2.connectedComponentsWithStats(markers_binary, connectivity=8)
-        valid_markers = [i for i in range(1, marker_count) if marker_stats[i, cv2.CC_STAT_AREA] >= Config.MIN_SEED_AREA]
+        valid_markers = [i for i in range(1, marker_count) if marker_stats[i, cv2.CC_STAT_AREA] >= settings.min_seed_area]
         if len(valid_markers) < 2:
             instances.append(component)
             continue
@@ -923,7 +939,7 @@ def split_instances_with_intelligence(foreground, boundary, spine, seed, uncerta
         markers[local_component > 0] = 0
         for marker_id, seed_id in enumerate(valid_markers, start=2):
             markers[marker_labels[y0:y1, x0:x1] == seed_id] = marker_id
-        surface = np.clip((1.0 - foreground[y0:y1, x0:x1]) + boundary[y0:y1, x0:x1] +
+        surface = np.clip((1.0 - densecrf_foreground[y0:y1, x0:x1]) + boundary[y0:y1, x0:x1] +
                           0.25 * uncertainty[y0:y1, x0:x1], 0.0, 1.0)
         watershed = cv2.watershed(np.repeat((surface * 255).astype(np.uint8)[..., None], 3, axis=2), markers)
         children = []
@@ -936,17 +952,24 @@ def split_instances_with_intelligence(foreground, boundary, spine, seed, uncerta
     return instances
 
 
+def resolve_components(densecrf_foreground, settings):
+    mask = (densecrf_foreground > settings.foreground_threshold).astype(np.uint8)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    return [(labels == label).astype(np.uint8) for label in range(1, count)
+            if stats[label, cv2.CC_STAT_AREA] >= settings.min_area]
+
+
 def postprocess_probability_v7(
     probabilities,
     img_limb_2048=None,
-    min_area=Config.MIN_AREA,
+    settings=DecoderSettings(),
 ):
     """Mandatory DenseCRF followed by learned boundary/seed-aware instance decoding."""
     if img_limb_2048 is None:
         raise ValueError('DenseCRF requires the native limb-corrected image.')
     foreground = apply_densecrf_2k(probabilities['foreground'], img_limb_2048)
-    return split_instances_with_intelligence(foreground, probabilities['boundary'], probabilities['spine'],
-                                             probabilities['seed'], probabilities['uncertainty'], min_area)
+    return resolve_instances(foreground, probabilities['boundary'], probabilities['spine'],
+                             probabilities['seed'], probabilities['uncertainty'], settings)
 
 
 def pycoco_rle_encode(img):
@@ -999,21 +1022,11 @@ def panoptic_metrics(predictions, targets):
     }
 
 
-def evaluate_panoptic(model, coco, records_by_filename, file_names):
-    """Evaluate every physical image prediction against every available annotation pass."""
-    totals = defaultdict(float)
-    for file_name in tqdm(file_names, desc='Validating PQ'):
-        probabilities, limb = predict_intelligence(model, os.path.join(Config.TRAIN_DIR, file_name))
-        predictions = postprocess_probability_v7(probabilities, limb)
-        for image_id in records_by_filename[file_name]:
-            targets = [(coco.annToMask(ann) > 0).astype(np.uint8) for ann in coco.imgToAnns.get(image_id, [])]
-            for key, value in panoptic_metrics(predictions, targets).items():
-                totals[key] += value
+def summarize_panoptic(totals):
     denominator = totals['tp'] + 0.5 * totals['fp'] + 0.5 * totals['fn']
-    pq = totals['sum_iou'] / denominator if denominator else 0.0
     dice_denominator = totals['pred_foreground_pixels'] + totals['gt_foreground_pixels']
     return {
-        'pq': pq,
+        'pq': totals['sum_iou'] / denominator if denominator else 0.0,
         'sq': totals['sum_iou'] / totals['tp'] if totals['tp'] else 0.0,
         'rq': totals['tp'] / denominator if denominator else 0.0,
         'dice': 2.0 * totals['foreground_intersection'] / dice_denominator if dice_denominator else 0.0,
@@ -1025,7 +1038,142 @@ def evaluate_panoptic(model, coco, records_by_filename, file_names):
     }
 
 
-def generate_submission(model, test_paths, out_path):
+def accumulate_pass_metrics(totals, predictions, coco, image_ids):
+    for image_id in image_ids:
+        targets = [(coco.annToMask(ann) > 0).astype(np.uint8) for ann in coco.imgToAnns.get(image_id, [])]
+        for key, value in panoptic_metrics(predictions, targets).items():
+            totals[key] += value
+
+
+def evaluate_panoptic(model, coco, records_by_filename, file_names, settings=DecoderSettings()):
+    """Evaluate every physical image prediction against every available annotation pass."""
+    totals = defaultdict(float)
+    for file_name in tqdm(file_names, desc='Validating PQ'):
+        probabilities, limb = predict_intelligence(model, os.path.join(Config.TRAIN_DIR, file_name))
+        predictions = postprocess_probability_v7(probabilities, limb, settings)
+        accumulate_pass_metrics(totals, predictions, coco, records_by_filename[file_name])
+    return summarize_panoptic(totals)
+
+
+def checkpoint_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, 'rb') as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def build_decoder_cache(model, file_names, checkpoint_path):
+    """Run GPU inference and DenseCRF exactly once per grouped development observation."""
+    cache_dir = os.path.join(Config.OUT_DIR, Config.DECODER_CACHE_DIR)
+    os.makedirs(cache_dir, exist_ok=True)
+    records = []
+    for index, file_name in enumerate(tqdm(file_names, desc='Caching decoder maps')):
+        probabilities, limb = predict_intelligence(model, os.path.join(Config.TRAIN_DIR, file_name))
+        densecrf_foreground = apply_densecrf_2k(probabilities['foreground'], limb)
+        paths = {}
+        for name, array in {**probabilities, 'densecrf_foreground': densecrf_foreground}.items():
+            relative_path = f'{index:04d}_{name}.npy'
+            np.save(os.path.join(cache_dir, relative_path), np.asarray(array, dtype=np.float32))
+            paths[name] = relative_path
+        records.append({'file_name': file_name, 'maps': paths})
+    manifest = {
+        'version': 1,
+        'checkpoint_path': checkpoint_path,
+        'checkpoint_sha256': checkpoint_sha256(checkpoint_path),
+        'split_seed': Config.SEED,
+        'file_names': list(file_names),
+        'records': records,
+    }
+    with open(os.path.join(cache_dir, 'manifest.json'), 'w') as handle:
+        json.dump(manifest, handle, indent=2)
+    return cache_dir, manifest
+
+
+def load_decoder_cache(cache_dir, checkpoint_path, expected_file_names):
+    with open(os.path.join(cache_dir, 'manifest.json')) as handle:
+        manifest = json.load(handle)
+    if manifest['checkpoint_sha256'] != checkpoint_sha256(checkpoint_path) or manifest['file_names'] != list(expected_file_names):
+        raise ValueError('Decoder cache does not match the selected checkpoint or grouped development split.')
+    return manifest
+
+
+def evaluate_cached_decoder(cache_dir, manifest, coco, records_by_filename, settings, components_only=False):
+    """Pure NumPy/OpenCV grouped-PQ evaluation; never invokes the model or DenseCRF."""
+    totals = defaultdict(float)
+    for record in manifest['records']:
+        maps = {name: np.load(os.path.join(cache_dir, relative_path)) for name, relative_path in record['maps'].items()}
+        predictions = resolve_components(maps['densecrf_foreground'], settings) if components_only else resolve_instances(
+            maps['densecrf_foreground'], maps['boundary'], maps['spine'], maps['seed'], maps['uncertainty'], settings)
+        accumulate_pass_metrics(totals, predictions, coco, records_by_filename[record['file_name']])
+    return summarize_panoptic(totals)
+
+
+def save_decoder_settings(path, settings, metrics, manifest):
+    payload = {'settings': asdict(settings), 'metrics': metrics, 'cache_version': manifest['version'],
+               'checkpoint_sha256': manifest['checkpoint_sha256'], 'split_seed': manifest['split_seed'],
+               'file_names': manifest['file_names']}
+    with open(path, 'w') as handle:
+        json.dump(payload, handle, indent=2)
+
+
+def load_decoder_settings(path):
+    with open(path) as handle:
+        return DecoderSettings(**json.load(handle)['settings'])
+
+
+def decoder_rank(metrics):
+    return (-metrics['pq'], -metrics['dice'], metrics['fragmentation_rate'], metrics['overmerge_rate'],
+            metrics['false_positive_rate'], metrics['false_negative_rate'])
+
+
+def calibrate_decoder_cache(cache_dir, manifest, coco, records_by_filename):
+    """Staged grouped-PQ search over cached arrays; never runs model inference or DenseCRF."""
+    stage_a = []
+    for threshold in np.linspace(0.25, 0.55, 7):
+        for min_area in (50, 100, 200, 400):
+            settings = DecoderSettings(foreground_threshold=float(threshold), min_area=min_area)
+            metrics = evaluate_cached_decoder(cache_dir, manifest, coco, records_by_filename, settings, components_only=True)
+            stage_a.append((settings, metrics))
+    stage_a.sort(key=lambda item: decoder_rank(item[1]))
+
+    best_settings = stage_a[0][0]
+    best_metrics = evaluate_cached_decoder(cache_dir, manifest, coco, records_by_filename, best_settings)
+    coarse_values = {
+        'boundary_threshold': np.linspace(0.35, 0.70, 6),
+        'spine_threshold': np.linspace(0.35, 0.70, 6),
+        'seed_threshold': np.linspace(0.35, 0.70, 6),
+        'uncertainty_threshold': np.linspace(0.40, 0.80, 5),
+        'min_seed_area': (5, 9, 16),
+    }
+    for initial_settings, _ in stage_a[:3]:
+        current = initial_settings
+        current_metrics = evaluate_cached_decoder(cache_dir, manifest, coco, records_by_filename, current)
+        for field, values in coarse_values.items():
+            candidates = [(replace(current, **{field: float(value) if 'threshold' in field else int(value)}), None) for value in values]
+            scored = [(candidate, evaluate_cached_decoder(cache_dir, manifest, coco, records_by_filename, candidate)) for candidate, _ in candidates]
+            current, current_metrics = min(scored, key=lambda item: decoder_rank(item[1]))
+        if decoder_rank(current_metrics) < decoder_rank(best_metrics):
+            best_settings, best_metrics = current, current_metrics
+
+    fine_ranges = {
+        'foreground_threshold': (0.25, 0.55), 'boundary_threshold': (0.35, 0.70),
+        'spine_threshold': (0.35, 0.70), 'seed_threshold': (0.35, 0.70),
+        'uncertainty_threshold': (0.40, 0.80),
+    }
+    for field, (lower, upper) in fine_ranges.items():
+        center = getattr(best_settings, field)
+        values = [value for value in (center - 0.04, center - 0.02, center, center + 0.02, center + 0.04)
+                  if lower <= value <= upper]
+        scored = []
+        for value in values:
+            candidate = replace(best_settings, **{field: float(value)})
+            scored.append((candidate, evaluate_cached_decoder(cache_dir, manifest, coco, records_by_filename, candidate)))
+        best_settings, best_metrics = min(scored, key=lambda item: decoder_rank(item[1]))
+    return best_settings, best_metrics
+
+
+def generate_submission(model, test_paths, out_path, settings):
     """Runs inference on test images and generates Kaggle submission.csv."""
     model.eval()
     submissions = []
@@ -1038,7 +1186,7 @@ def generate_submission(model, test_paths, out_path):
             instances = postprocess_probability_v7(
                 probabilities,
                 img_limb_2048=img_limb_2048,
-                min_area=Config.MIN_AREA,
+                settings=settings,
             )
 
             for i, inst_mask in enumerate(instances, start=1):
@@ -1178,8 +1326,16 @@ def main():
     print("\n" + "=" * 60)
     print("Loading best checkpoint for Kaggle submission...")
     base_model(model).load_state_dict(torch.load(model_path, map_location=Config.DEVICE, weights_only=True))
-    audit_metrics = evaluate_panoptic(model, coco, records_by_filename, audit_files)
-    metric_history.append({'epoch': 'best', 'split': 'audit', **audit_metrics})
+    cache_dir, manifest = build_decoder_cache(model, dev_files, model_path)
+    manifest = load_decoder_cache(cache_dir, model_path, dev_files)
+    decoder_settings, calibration_metrics = calibrate_decoder_cache(cache_dir, manifest, coco, records_by_filename)
+    settings_path = os.path.join(Config.OUT_DIR, Config.DECODER_SETTINGS_FILE)
+    save_decoder_settings(settings_path, decoder_settings, calibration_metrics, manifest)
+    decoder_settings = load_decoder_settings(settings_path)
+    print(f"Frozen decoder settings: {asdict(decoder_settings)} | development PQ: {calibration_metrics['pq']:.4f}")
+
+    audit_metrics = evaluate_panoptic(model, coco, records_by_filename, audit_files, settings=decoder_settings)
+    metric_history.append({'epoch': 'best', 'split': 'decoder_audit', **audit_metrics, **{f'decoder_{key}': value for key, value in asdict(decoder_settings).items()}})
     pd.DataFrame(metric_history).to_csv(metrics_path, index=False)
     print(f"Frozen audit PQ: {audit_metrics['pq']:.4f} | SQ: {audit_metrics['sq']:.4f} | RQ: {audit_metrics['rq']:.4f} | "
           f"Dice: {audit_metrics['dice']:.4f}")
@@ -1188,7 +1344,7 @@ def main():
     print(f"Found {len(test_imgs)} test images.")
 
     submission_path = os.path.join(Config.OUT_DIR, 'submission.csv')
-    generate_submission(model, test_imgs, submission_path)
+    generate_submission(model, test_imgs, submission_path, decoder_settings)
     print("=" * 60)
     print("V7 PIPELINE COMPLETE!")
     print(f"Submission written to: {submission_path}")

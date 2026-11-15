@@ -33,6 +33,7 @@ def build_vanilla_cfg(
     cfg.INPUT.MAX_SIZE_TRAIN = 1344
     cfg.INPUT.MIN_SIZE_TEST = 1024
     cfg.INPUT.MAX_SIZE_TEST = 1024
+    cfg.INPUT.MASK_FORMAT = "bitmask"
     cfg.SOLVER.IMS_PER_BATCH = 2
     cfg.SOLVER.BASE_LR = 0.0005
     cfg.SOLVER.WARMUP_ITERS = 300

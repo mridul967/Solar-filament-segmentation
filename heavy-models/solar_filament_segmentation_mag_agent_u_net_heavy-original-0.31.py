@@ -46,11 +46,11 @@ if torch.cuda.is_available():
 
 class Config:
     # === EXACT PATHS (verified from directory scan) ===
-    BASE_DIR = '/kaggle/input/competitions/filament-segmentation-2026/MAGFiLO_1.0_Kaggle_2026'
-    TRAIN_DIR = os.path.join(BASE_DIR, 'train/train_images')
-    TEST_DIR = os.path.join(BASE_DIR, 'test/test_images')
-    ANNOTATIONS_FILE = os.path.join(BASE_DIR, 'train/MAGFiLO_1.0_Annotations_kaggle2026_train.json')
-    OUT_DIR = '/kaggle/working/'
+    BASE_DIR = '/content/dataset/MAGFiLO_1.0_Kaggle_2026'
+    TRAIN_DIR = os.path.join(BASE_DIR, '/content/dataset/MAGFiLO_1.0_Kaggle_2026/train/train_images')
+    TEST_DIR = os.path.join(BASE_DIR, '/content/dataset/MAGFiLO_1.0_Kaggle_2026/test/test_images')
+    ANNOTATIONS_FILE = os.path.join(BASE_DIR, '/content/dataset/MAGFiLO_1.0_Kaggle_2026/train/MAGFiLO_1.0_Annotations_kaggle2026_train.json')
+    OUT_DIR = '/content/working/'
     
     # === IMAGE DIMENSIONS ===
     # GONG H-alpha images are 2048x2048.
@@ -60,14 +60,12 @@ class Config:
     ORIGINAL_SIZE = 2048
     
     # === TRAINING HYPERPARAMETERS ===
-    # Two T4s receive one image each; two optimizer steps are accumulated so
-    # the effective batch size remains 4 without changing the architecture.
-    BATCH_SIZE = 2
-    ACCUM_STEPS = 2
+    BATCH_SIZE = 4      # L4 can handle 4x 1024x1024 images
+    ACCUM_STEPS = 1     # Drop accumulation, do it in one step
     EPOCHS = 25           # Total training epochs
     LR = 2e-4             # Learning rate (Adam optimizer)
     WEIGHT_DECAY = 1e-4   # L2 regularization
-    NUM_WORKERS = 2       # DataLoader workers
+    NUM_WORKERS = 4       # DataLoader workers
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
     
     # === MODEL PARAMETERS ===
@@ -77,6 +75,8 @@ class Config:
     # === SUBMISSION PARAMETERS ===
     MIN_AREA = 200        # Minimum pixel area to count as a valid filament (filters noise)
     THRESHOLD = 0.4       # Probability threshold for binary mask
+
+os.makedirs(Config.OUT_DIR, exist_ok=True)
 
 # Verify paths exist
 print(f"Train dir exists: {os.path.exists(Config.TRAIN_DIR)}")
@@ -173,79 +173,72 @@ def get_magnetic_proxy(img):
     coherence = (coherence - coherence.min()) / (coherence.max() - coherence.min() + 1e-8)
     return coherence
 
-# %% [code] {"execution":{"iopub.status.busy":"2026-10-17T10:17:42.408949Z","iopub.execute_input":"2026-10-17T10:17:42.409278Z","iopub.status.idle":"2026-10-17T10:17:42.431490Z","shell.execute_reply.started":"2026-10-17T10:17:42.409260Z","shell.execute_reply":"2026-10-17T10:17:42.430710Z"}}
-# CELL 4: PyTorch Dataset class (FIXED FOR STRING IDs)
-# FIX: Bypasses pycocotools' buggy loadImgs() and getAnnIds() functions
-# by directly accessing the underlying coco.imgs and coco.imgToAnns dictionaries.
-# This prevents the "isArrayLike" bug where strings are iterated character-by-character.
+# %% [code]
+# CELL 3.1: Precompute 3-channel 1024x1024 training inputs (run once before training)
+img_dir = Config.TRAIN_DIR
+out_dir = os.path.join(Config.OUT_DIR, 'precomputed_1024')
+os.makedirs(out_dir, exist_ok=True)
 
-class SolarDataset(Dataset):
-    def __init__(self, coco, img_ids, img_dir, img_size=1024, transforms=None):
+for path in tqdm(glob.glob(os.path.join(img_dir, '*.jpeg'))):
+    img = load_image(path)
+    img = (img - img.min()) / (img.max() - img.min() + 1e-8)
+    img_limb, _ = remove_limb_darkening(img)
+    mag_map = get_magnetic_proxy(img_limb)
+
+    # Stack and resize to 1024 ONCE
+    img_3ch = np.stack([img_limb, img_limb, mag_map], axis=-1).astype(np.float32)
+    img_1024 = cv2.resize(img_3ch, (1024, 1024))
+
+    # Save as numpy array
+    np.save(
+        os.path.join(out_dir, os.path.basename(path).replace('.jpeg', '.npy')),
+        img_1024.astype(np.float16),
+    )
+
+# %% [code] {"execution":{"iopub.status.busy":"2026-10-17T10:17:42.408949Z","iopub.execute_input":"2026-10-17T10:17:42.409278Z","iopub.status.idle":"2026-10-17T10:17:42.431490Z","shell.execute_reply.started":"2026-10-17T10:17:42.409260Z","shell.execute_reply":"2026-10-17T10:17:42.430710Z"}}
+# CELL 4: Fast PyTorch Dataset class using precomputed inputs
+class SolarDatasetFast(Dataset):
+    def __init__(self, coco, img_ids, precomputed_dir, img_size=1024, transforms=None):
         self.coco = coco
         self.img_ids = img_ids
-        self.img_dir = img_dir
-        self.img_size = img_size
+        self.precomputed_dir = precomputed_dir
         self.transforms = transforms
 
-    def __len__(self):
-        return len(self.img_ids)
+    def __len__(self): return len(self.img_ids)
 
     def __getitem__(self, idx):
         img_id = self.img_ids[idx]
-        
-        # FIX 1: Direct dictionary access (avoids loadImgs string bug)
-        img_info = self.coco.imgs[img_id]
-        file_name = img_info['file_name']
-        img_path = os.path.join(self.img_dir, file_name)
-        
-        # Load and normalize image
-        img = load_image(img_path)
-        if img is None:
-            img = np.random.randint(0, 65535, (2048, 2048), dtype=np.uint16)
-        
-        img = (img - img.min()) / (img.max() - img.min() + 1e-8)
-        
-        # Apply preprocessing
-        img_limb, _ = remove_limb_darkening(img)
-        mag_map = get_magnetic_proxy(img_limb)
-        
-        # Stack into 3 channels: [H-alpha, H-alpha, Magnetic Map]
-        img_3ch = np.stack([img_limb, img_limb, mag_map], axis=-1).astype(np.float32)
-        img_3ch = cv2.resize(img_3ch, (self.img_size, self.img_size))
-        
-        # FIX 2: Direct dictionary access for annotations
-        # coco.imgToAnns maps image_id directly to a list of annotation dicts
+        file_name = self.coco.imgs[img_id]['file_name']
+
+        # 1. Load precomputed 1024x1024 3-channel image (Instant)
+        npy_path = os.path.join(self.precomputed_dir, file_name.replace('.jpeg', '.npy'))
+        img_3ch = np.load(npy_path).astype(np.float32)
+
+        # 2. Load and resize mask
         anns = self.coco.imgToAnns.get(img_id, [])
         
-        # Create combined binary mask at original 2048x2048 resolution
         mask_2048 = np.zeros((2048, 2048), dtype=np.float32)
         for ann in anns:
-            # annToMask handles the polygon_list format perfectly
-            m = self.coco.annToMask(ann)
-            mask_2048 = np.maximum(mask_2048, m)
-        
-        # Resize mask to training size
-        mask = cv2.resize(mask_2048, (self.img_size, self.img_size))
+            mask_2048 = np.maximum(mask_2048, self.coco.annToMask(ann))
+        mask = cv2.resize(mask_2048, (1024, 1024))
         mask = (mask > 0.5).astype(np.float32)
-        
-        # Apply augmentations
+
+        # 3. Augmentations
         if self.transforms:
             aug = self.transforms(image=img_3ch, mask=mask)
-            img_3ch = aug['image']
-            mask = aug['mask']
-        
-        # Ensure correct tensor shapes regardless of whether transforms were applied
-        # After ToTensorV2(): img is already (C, H, W), mask is (H, W)
+            img_3ch, mask = aug['image'], aug['mask']
+
+        # Ensure tensor format
         if isinstance(img_3ch, np.ndarray):
             img_3ch = torch.from_numpy(img_3ch).permute(2, 0, 1).float()
         else:
             img_3ch = img_3ch.float()
-            
+
         if isinstance(mask, np.ndarray):
             mask = torch.from_numpy(mask).unsqueeze(0).float()
         else:
             mask = mask.unsqueeze(0).float()
-        
+
         return img_3ch, mask
 
 # Define augmentation pipelines (Keep these below the class)
@@ -715,12 +708,13 @@ def main():
     print(f"Validation images: {len(val_ids)}")
     
     # === 3. Create Datasets and DataLoaders ===
-    train_ds = SolarDataset(coco, train_ids, Config.TRAIN_DIR, Config.IMG_SIZE, train_transforms)
-    val_ds = SolarDataset(coco, val_ids, Config.TRAIN_DIR, Config.IMG_SIZE, val_transforms)
+    train_ds = SolarDatasetFast(coco, train_ids, os.path.join(Config.OUT_DIR, 'precomputed_1024'), Config.IMG_SIZE, train_transforms)
+    val_ds = SolarDatasetFast(coco, val_ids, os.path.join(Config.OUT_DIR, 'precomputed_1024'), Config.IMG_SIZE, val_transforms)
     
     train_loader = DataLoader(
         train_ds, batch_size=Config.BATCH_SIZE, shuffle=True,
-        num_workers=Config.NUM_WORKERS, pin_memory=True
+        num_workers=Config.NUM_WORKERS, pin_memory=True,
+        persistent_workers=True
     )
     val_loader = DataLoader(
         val_ds, batch_size=Config.BATCH_SIZE, shuffle=False,
@@ -728,11 +722,11 @@ def main():
     )
     
     # === 4. Initialize Model ===
-    model = MagAgentU2Net(in_ch=Config.IN_CHANNELS, out_ch=Config.OUT_CHANNELS)
+    model = MagAgentU2Net(in_ch=Config.IN_CHANNELS, out_ch=Config.OUT_CHANNELS).to(Config.DEVICE)
+    model = torch.compile(model)
     if torch.cuda.device_count() > 1:
         print(f"Using {torch.cuda.device_count()} GPUs with DataParallel")
         model = nn.DataParallel(model)
-    model = model.to(Config.DEVICE)
     optimizer = torch.optim.AdamW(model.parameters(), lr=Config.LR, weight_decay=Config.WEIGHT_DECAY)
     criterion = DiceBCELoss()
     scaler = torch.amp.GradScaler('cuda')
@@ -864,7 +858,7 @@ def visualize_predictions(model, coco, img_ids, img_dir, num_samples=4):
 import json
 from pycocotools.coco import COCO
 
-ANNOTATIONS_FILE = '/kaggle/input/competitions/filament-segmentation-2026/MAGFiLO_1.0_Kaggle_2026/train/MAGFiLO_1.0_Annotations_kaggle2026_train.json'
+ANNOTATIONS_FILE = Config.ANNOTATIONS_FILE
 
 # === 1. Raw JSON structure ===
 with open(ANNOTATIONS_FILE, 'r') as f:

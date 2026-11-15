@@ -12,10 +12,15 @@ Postprocessor = Callable[[np.ndarray, np.ndarray, np.ndarray], list[np.ndarray]]
 IMAGE_EXTENSIONS = {".jpeg", ".jpg", ".png"}
 
 
-def build_predictor(cfg):
-    from detectron2.engine import DefaultPredictor
+def build_predictor(cfg, *, tiling=None):
+    """Build either the standard full-image predictor or tiled wrapper."""
+    if tiling is None:
+        from detectron2.engine import DefaultPredictor
 
-    return DefaultPredictor(cfg)
+        return DefaultPredictor(cfg)
+    from .tiling import build_tiled_predictor
+
+    return build_tiled_predictor(cfg, tiling)
 
 
 def encode_rle(binary_mask: np.ndarray) -> str:

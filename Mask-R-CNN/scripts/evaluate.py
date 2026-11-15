@@ -13,6 +13,7 @@ from filament_mask_rcnn.artifacts import write_json
 from filament_mask_rcnn.data import SplitPaths, register_splits
 from filament_mask_rcnn.evaluation import evaluate
 from filament_mask_rcnn.model import load_run_cfg
+from filament_mask_rcnn.tiling import TilingSettings
 
 
 def parse_args() -> argparse.Namespace:
@@ -20,6 +21,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-dir", required=True, type=Path)
     parser.add_argument("--train-image-root", required=True, type=Path)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--tiled-inference", action="store_true")
+    parser.add_argument("--tile-size", type=int, default=1024)
+    parser.add_argument("--tile-overlap", type=float, default=0.25)
     return parser.parse_args()
 
 
@@ -29,8 +33,11 @@ def main() -> None:
     splits = SplitPaths(args.run_dir / "splits/train.json", args.run_dir / "splits/val.json", classes)
     _, val_name, _ = register_splits(splits, args.train_image_root)
     cfg = load_run_cfg(args.run_dir / "config.yaml", args.run_dir / "model_final.pth", device=args.device)
-    metrics = evaluate(cfg, val_name, args.run_dir / "eval_val")
-    write_json(args.run_dir / "validation_metrics.json", metrics)
+    tiling = TilingSettings(args.tile_size, args.tile_overlap) if args.tiled_inference else None
+    mode = "tiled" if tiling else "full"
+    metrics = evaluate(cfg, val_name, args.run_dir / f"eval_val_{mode}", tiling=tiling)
+    write_json(args.run_dir / f"validation_metrics_{mode}.json", metrics)
+    write_json(args.run_dir / f"evaluation_tiling_settings_{mode}.json", {"enabled": bool(tiling), **(tiling.as_dict() if tiling else {})})
 
 
 if __name__ == "__main__":

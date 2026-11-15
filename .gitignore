@@ -10,3 +10,36 @@ wheels/
 .venv
 .agents/
 graphify-out/
+
+# macOS & Jupyter
+.DS_Store
+.ipynb_checkpoints/
+
+# Model weights & checkpoints
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.onnx
+*.bin
+
+# Kaggle / training outputs & logs
+submission*.csv
+*.log
+runs/
+wandb/
+outputs/
+
+# Datasets & cached arrays
+data/
+datasets/
+*.zip
+*.tar.gz
+*.npz
+*.npy
+*.h5
+
+# Tool caches & credentials
+.pytest_cache/
+.env
+kaggle.json
